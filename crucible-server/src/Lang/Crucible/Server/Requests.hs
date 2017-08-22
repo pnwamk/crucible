@@ -484,6 +484,10 @@ data BackendSpecificRequests p sym
          :: Simulator p sym
          -> P.VarType
          -> IO ()
+      , fulfillOverrideRequest
+         :: Simulator p sym
+         -> P.Harness
+         -> IO ()
       }
 
 -- | Loop for fulfilling request

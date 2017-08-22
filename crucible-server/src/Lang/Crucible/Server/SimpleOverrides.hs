@@ -98,6 +98,7 @@ simpleBackendRequests =
   BackendSpecificRequests
   { fulfillExportModelRequest = sbFulfillExportModelRequest
   , fulfillSymbolHandleRequest = sbFulfillSymbolHandleRequest
+  , fulfillOverrideRequest = \_ _ -> fail "simple backend does not support overrides"
   }
 
 ------------------------------------------------------------------------

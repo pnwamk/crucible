@@ -1041,3 +1041,40 @@ enum CallRequestCode {
   // Stop executing the call and switch back to a paused state (no response needeD).
   AbortCall = 2;
 }
+
+enum HarnessInputType {
+    ConstantInput = 1;
+    SymbolicInput = 2;
+    RelativeInput = 3;
+}
+
+message HarnessInput {
+    required HarnessInputType input_type = 1;
+    optional int64 width = 2; // width
+    optional int64 value = 3; // value
+}
+
+message HarnessLoad {
+  required int32 dst_key = 1;
+  required int32 src_key = 2; // input key
+}
+
+message HarnessRegister {
+  required int64 offset    = 1;
+  required int32 value_key = 2;
+  required string expression = 3;
+}
+
+message HarnessStore {
+  required int32 src_key   = 1; // Address key
+  required int32 elt_width = 2;
+  required int32 elt_count = 3;
+}
+
+message Harness {
+  repeated HarnessInput    input     = 1;
+  repeated HarnessLoad     load      = 3;
+  repeated HarnessRegister argument  = 4;
+  repeated HarnessRegister return    = 2;
+  repeated HarnessStore    store     = 5;
+}

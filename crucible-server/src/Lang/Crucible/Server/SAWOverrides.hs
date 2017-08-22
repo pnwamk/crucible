@@ -33,11 +33,15 @@ import qualified Data.Sequence as Seq
 import qualified Data.Text as Text
 import qualified Data.Vector as V
 
+import           GHC.TypeLits
+
+import           Lang.Crucible.CFG.Core
 import qualified Lang.Crucible.Proto as P
 import           Lang.Crucible.Server.Requests
 import           Lang.Crucible.Server.Simulator
 import           Lang.Crucible.Server.TypeConv
 import           Lang.Crucible.Server.ValueConv
+import           Lang.Crucible.Server.SAWMethodOverride
 import           Lang.Crucible.Simulator.CallFrame (SomeHandle(..))
 import           Lang.Crucible.Simulator.OverrideSim
 import           Lang.Crucible.Simulator.RegMap
@@ -55,7 +59,25 @@ sawBackendRequests =
   BackendSpecificRequests
   { fulfillExportModelRequest = sawFulfillExportModelRequest
   , fulfillSymbolHandleRequest = sawFulfillSymbolHandleRequest
+  , fulfillOverrideRequest = \_ _ -> fail "Not implemented"
   }
+
+sawFulfillOverrideRequest ::
+  Simulator p (SAW.SAWCoreBackend n) ->
+  P.Harness ->
+  IO ()
+sawFulfillOverrideRequest sim harness =
+  do let byteWidth = knownNat :: NatRepr 8
+         regWidth  = knownNat :: NatRepr 16
+         addrWidth = knownNat :: NatRepr 64
+         byteRepr = BaseBVRepr byteWidth
+         registerFileRepr = WordMapRepr regWidth byteRepr
+         memoryRepr       = WordMapRepr addrWidth byteRepr
+         registerAndMemory = (Ctx.empty Ctx.%> registerFileRepr Ctx.%> memoryRepr)
+         returnType        = StructRepr registerAndMemory
+     h <- simOverrideHandle sim registerAndMemory returnType (runHarness harness)
+     return ()
+
 
 sawFulfillExportModelRequest
    :: forall p n

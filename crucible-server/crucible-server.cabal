@@ -49,6 +49,7 @@ library
     Lang.Crucible.Server.MultipartOperations
     Lang.Crucible.Server.Requests
     Lang.Crucible.Server.SAWOverrides
+    Lang.Crucible.Server.SAWMethodOverride
     Lang.Crucible.Server.SimpleOverrides
     Lang.Crucible.Server.Simulator
     Lang.Crucible.Server.Translation

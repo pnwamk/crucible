@@ -680,7 +680,7 @@ public abstract class ValueCreator<T extends Typed> {
             }
         }
 
-        return applyPrimitive( Type.vector(type), Protos.PrimitiveOp.VectorLit, xs );
+        return applyPrimitive( Type.vector(type), Protos.PrimitiveOp.VectorLit, (Object[])xs );
     }
 
     public T vectorReplicate( T n, T elem ) throws Exception {
@@ -743,7 +743,7 @@ public abstract class ValueCreator<T extends Typed> {
         }
         Type retType = Type.struct( tys );
 
-        return applyPrimitive( retType, Protos.PrimitiveOp.StructLiteral, vals );
+        return applyPrimitive( retType, Protos.PrimitiveOp.StructLiteral, (Object[])vals );
     }
 
     public T structGet( int idx, T struct ) {
