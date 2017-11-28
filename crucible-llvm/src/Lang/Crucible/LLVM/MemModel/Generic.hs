@@ -285,7 +285,11 @@ readMem :: (1 <= w, IsSymInterface sym)
         -> IO (Pred sym, PartLLVMVal sym w)
 readMem sym w l tp m = do
   ld <- ptrDecompose sym w l
-  readMem' sym w (l,ld) tp (memWrites m)
+  sz <- bvLit sym w (bytesToInteger (typeEnd 0 tp))
+  p  <- isAllocated sym w l sz m
+  (p', val) <- readMem' sym w (l,ld) tp (memWrites m)
+  p'' <- andPred sym p p'
+  return (p'', val)
 
 -- | Read a value from memory given a list of writes.
 --
@@ -599,6 +603,7 @@ freeMem' sym w p p_decomp m = do
   freeAllocs (a@(Alloc _ _ _ _) : as) = do
      (c, as') <- freeAllocs as
      return (c, a:as')
+
   freeAllocs (AllocMerge cm x y : as) = do
      (c1, x') <- freeAllocs x
      (c2, y') <- freeAllocs y
@@ -682,7 +687,7 @@ ppTermExpr t = -- FIXME, do something with the predicate?
 ppType :: Type -> Doc
 ppType tp =
   case typeF tp of
-    Bitvector w -> text ('i': show (w * 8))
+    Bitvector w -> text ('i': show (bytesToBits w))
     Float -> text "float"
     Double -> text "double"
     Array n etp -> brackets (text (show n) <+> char 'x' <+> ppType etp)

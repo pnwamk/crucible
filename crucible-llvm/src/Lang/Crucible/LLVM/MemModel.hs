@@ -301,9 +301,9 @@ allocGlobal :: IsSymInterface sym
             -> MemImpl sym PtrWidth
             -> (L.Symbol, G.Size)
             -> IO (MemImpl sym PtrWidth)
-allocGlobal sym mem (symbol, sz) = do
+allocGlobal sym mem (symbol@(L.Symbol sym_str), sz) = do
   sz' <- bvLit sym ptrWidth (G.bytesToInteger sz)
-  (ptr, mem') <- doMalloc sym mem sz'
+  (ptr, mem') <- doMalloc sym G.GlobalAlloc sym_str mem sz'
   return (registerGlobal mem' symbol ptr)
 
 -- | Add an entry to the 'GlobalMap' of the given 'MemImpl'.
@@ -539,7 +539,9 @@ storeRaw :: IsSymInterface sym
   -> IO (MemImpl sym PtrWidth)
 storeRaw sym mem ptr valType val = do
     (p, heap') <- G.writeMem sym ptrWidth ptr valType (PE (truePred sym) val) (memImplHeap mem)
-    addAssertion sym p (AssertFailureSimError "Invalid memory store")
+    let errMsg = "Invalid memory store: address " ++ show (G.ppLLVMPtr ptr) ++
+                 " at type " ++ show (G.ppType valType)
+    addAssertion sym p (AssertFailureSimError errMsg)
     return mem{ memImplHeap = heap' }
 
 
@@ -552,10 +554,12 @@ doStore :: IsSymInterface sym
   -> IO (RegValue sym Mem)
 doStore sym mem ptr valType (AnyValue tpr val) = do
     --putStrLn "MEM STORE"
+    let errMsg = "Invalid memory store: address " ++ show (ppPtr ptr) ++
+                 " at type " ++ show (G.ppType valType)
     val' <- packMemValue sym valType tpr val
     ptr' <- translatePtr sym ptr
     (p, heap') <- G.writeMem sym ptrWidth ptr' valType (PE (truePred sym) val') (memImplHeap mem)
-    addAssertion sym p (AssertFailureSimError "Invalid memory store")
+    addAssertion sym p (AssertFailureSimError errMsg)
     return mem{ memImplHeap = heap' }
 
 memStore :: IntrinsicImpl p sym (EmptyCtx ::> Mem ::> LLVMPointerType ::> LLVMValTypeType ::> AnyType) Mem
@@ -711,7 +715,7 @@ doCalloc sym mem sz num = do
      (AssertFailureSimError "Multiplication overflow in calloc()")
 
   z <- bvLit sym knownNat 0
-  (ptr, mem') <- doMalloc sym mem sz'
+  (ptr, mem') <- doMalloc sym G.HeapAlloc "<calloc>" mem sz'
   mem'' <- doMemset sym ptrWidth mem' ptr z sz'
   return (ptr, mem'')
 
@@ -719,10 +723,12 @@ doCalloc sym mem sz num = do
 doMalloc
   :: IsSymInterface sym
   => sym
+  -> G.AllocType
+  -> String
   -> MemImpl sym PtrWidth
   -> RegValue sym (BVType PtrWidth)
   -> IO (RegValue sym LLVMPointerType, MemImpl sym PtrWidth)
-doMalloc sym mem sz = do
+doMalloc sym allocType loc mem sz = do
   --sz_doc <- printSymExpr sym sz
   --putStrLn $ unwords ["doMalloc", show nextBlock, show sz_doc]
 
@@ -730,7 +736,7 @@ doMalloc sym mem sz = do
   blk <- liftIO $ natLit sym (fromIntegral blkNum)
   z <- liftIO $ bvLit sym ptrWidth 0
 
-  let heap' = G.allocMem G.HeapAlloc (fromInteger blkNum) sz "<malloc>" (memImplHeap mem)
+  let heap' = G.allocMem allocType (fromInteger blkNum) sz loc (memImplHeap mem)
   let ptr = llvmPointer sym blk sz z
   return (ptr, mem{ memImplHeap = heap' })
 
@@ -753,15 +759,17 @@ mallocRaw sym mem sz = do
 doMallocHandle
   :: (Typeable a, IsSymInterface sym)
   => sym
+  -> G.AllocType
+  -> String
   -> MemImpl sym PtrWidth
   -> a
   -> IO (RegValue sym LLVMPointerType, MemImpl sym PtrWidth)
-doMallocHandle sym mem x = do
+doMallocHandle sym allocType loc mem x = do
   blkNum <- nextBlock (memImplBlockSource mem)
   blk <- liftIO $ natLit sym (fromIntegral blkNum)
   z <- liftIO $ bvLit sym ptrWidth 0
 
-  let heap' = G.allocMem G.HeapAlloc (fromInteger blkNum) z "<malloc>" (memImplHeap mem)
+  let heap' = G.allocMem allocType (fromInteger blkNum) z loc (memImplHeap mem)
   let hMap' = Map.insert blkNum (toDyn x) (memImplHandleMap mem)
   let ptr = llvmPointer sym blk z z
   return (ptr, mem{ memImplHeap = heap', memImplHandleMap = hMap' })
@@ -799,11 +807,12 @@ doFree sym mem ptr = do
          Just i  -> Map.delete (toInteger i) (memImplHandleMap mem)
          Nothing -> memImplHandleMap mem
 
+  let errMsg = "Invalid free (double free or invalid pointer): address " ++ show (ppPtr ptr)
+
   -- NB: free is defined and has no effect if passed a null pointer
   isNull <- ptrIsNull sym ptr
   c' <- orPred sym c isNull
-  addAssertion sym c'
-     (AssertFailureSimError "Invalid free (double free or invalid pointer)")
+  addAssertion sym c' (AssertFailureSimError errMsg)
   return mem{ memImplHeap = heap', memImplHandleMap = hMap' }
 
 doMemset
