@@ -10,33 +10,178 @@
 
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE GADTs #-}
+{-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE PatternGuards #-}
+{-# LANGUAGE PatternSynonyms #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE TupleSections #-}
+{-# LANGUAGE TypeApplications #-}
+{-# LANGUAGE TypeFamilies #-}
 {-# LANGUAGE TypeOperators #-}
 {-# LANGUAGE ViewPatterns #-}
 
-module Lang.Crucible.LLVM.MemModel.Pointer where
+{-# OPTIONS_GHC -fno-warn-orphans #-}
+module Lang.Crucible.LLVM.MemModel.Pointer
+( -- * Pointer bitwidth
+  PtrWidth
+, ptrWidth
 
+  -- * Crucible pointer representation
+, LLVMPointerType
+, llvmPointerRepr
+, pattern LLVMPointerRepr
+, llvmPointer
+, llvmPointer_bv
+, llvmPointerCases
+, projectLLVM_bv
+, projectLLVM_pointer
+
+  -- * LLVM Value representation
+, LLVMVal(..)
+, PartLLVMVal
+, applyCtorFLLVMVal
+, applyViewFLLVMVal
+, muxLLVMVal
+
+  -- * Operations on valid pointers
+, LLVMPtr(..)
+, AddrDecomposeResult(..)
+, muxLLVMPtr
+, ptrToPtrVal
+, ptrConst
+, ptrDecompose
+, ptrSizeDecompose
+, ptrComparable
+, ptrOffsetEq
+, ptrOffsetLe
+, ptrEq
+, ptrLe
+, ptrAdd
+, ptrCheckedAdd
+, ptrDiff
+, ptrSub
+) where
+
+import           Control.Lens
 import           Control.Monad
 import           Control.Monad.IO.Class
 import           Control.Monad.Trans.Maybe
 import           Control.Monad.State.Strict
 
 import           Data.Parameterized.Classes
+import qualified Data.Parameterized.Context as Ctx
 import           Data.Parameterized.NatRepr
 import           Data.Parameterized.Some
 import           Data.Vector( Vector )
 import qualified Data.Vector as V
 import           Numeric.Natural
 
+import           Lang.Crucible.Simulator.RegValue
 import           Lang.Crucible.Simulator.SimError
 import           Lang.Crucible.Solver.Interface
 import           Lang.Crucible.Solver.Partial
+import           Lang.Crucible.Types
 import qualified Lang.Crucible.LLVM.MemModel.Common as G
 
 
-type PartLLVMVal sym w = PartExpr (Pred sym) (LLVMVal sym w)
+type PtrWidth = 64
+ptrWidth :: NatRepr PtrWidth
+ptrWidth = knownNat
+
+type LLVMPointerType = RecursiveType "LLVM_pointer"
+llvmPointerRepr :: TypeRepr LLVMPointerType
+llvmPointerRepr = knownRepr
+
+instance IsRecursiveType "LLVM_pointer" where
+  type UnrollType "LLVM_pointer" =
+     VariantType (EmptyCtx ::>
+       BVType PtrWidth ::>
+       StructType (EmptyCtx ::> NatType ::> BVType PtrWidth ::> BVType PtrWidth))
+  unrollType _ =
+     VariantRepr (Ctx.empty Ctx.:>
+       BVRepr ptrWidth Ctx.:>
+       StructRepr (Ctx.empty Ctx.:>NatRepr Ctx.:> BVRepr ptrWidth Ctx.:> BVRepr ptrWidth))
+
+
+pattern LLVMPointerRepr :: () => (ty ~ LLVMPointerType) => TypeRepr ty
+pattern LLVMPointerRepr <- RecursiveRepr (testEquality (knownSymbol :: SymbolRepr "LLVM_pointer") -> Just Refl)
+  where
+    LLVMPointerRepr = llvmPointerRepr
+
+llvmPointer ::
+  IsSymInterface sym =>
+  sym ->
+  RegValue sym NatType ->
+  RegValue sym (BVType PtrWidth) ->
+  RegValue sym (BVType PtrWidth) ->
+  RegValue sym LLVMPointerType
+llvmPointer sym blk end off =
+  RolledType $ injectVariant sym knownRepr (Ctx.natIndex @1) $
+    (Ctx.empty Ctx.:> RV blk Ctx.:> RV end Ctx.:> RV off)
+
+llvmPointer_bv ::
+  IsSymInterface sym =>
+  sym ->
+  RegValue sym (BVType PtrWidth) ->
+  RegValue sym LLVMPointerType
+llvmPointer_bv sym bv =
+  RolledType $ injectVariant sym knownRepr (Ctx.natIndex @0) bv
+
+llvmPointerCases ::
+  IsSymInterface sym =>
+  sym ->
+  (sym -> Pred sym -> a -> a -> IO a) ->
+  (RegValue sym (BVType PtrWidth) -> IO a) ->
+  (RegValue sym NatType ->
+   RegValue sym (BVType PtrWidth) ->
+   RegValue sym (BVType PtrWidth) ->
+   IO a) ->
+  RegValue sym LLVMPointerType ->
+  IO a
+llvmPointerCases sym muxFn bvCase ptrCase (RolledType v) =
+  case (v^._1, v^._2) of
+    (VB (PE pbv bv), VB Unassigned) ->
+      do a <- bvCase bv
+         addAssertion sym pbv PatternMatchFailureSimError
+         return a
+    (VB Unassigned, VB (PE pptr (Ctx.Empty Ctx.:> RV blk Ctx.:> RV end Ctx.:> RV off))) ->
+      do a <- ptrCase blk end off
+         addAssertion sym pptr PatternMatchFailureSimError
+         return a
+    (VB (PE pbv bv), VB (PE pptr (Ctx.Empty Ctx.:> RV blk Ctx.:> RV end Ctx.:> RV off))) ->
+      do abv  <- bvCase bv
+         aptr <- ptrCase blk end off
+         a <- muxFn sym pbv abv aptr
+         p <- orPred sym pbv pptr
+         addAssertion sym p PatternMatchFailureSimError
+         return a
+    _ ->
+      addFailedAssertion sym PatternMatchFailureSimError
+
+projectLLVM_bv ::
+  IsSymInterface sym =>
+  sym ->
+  RegValue sym LLVMPointerType ->
+  IO (RegValue sym (BVType PtrWidth))
+projectLLVM_bv sym (RolledType vs) =
+  case vs^._1 of
+    VB (PE p bv) ->
+      do addAssertion sym p PatternMatchFailureSimError
+         return bv
+    _ -> addFailedAssertion sym PatternMatchFailureSimError
+
+projectLLVM_pointer ::
+  IsSymInterface sym =>
+  sym ->
+  RegValue sym LLVMPointerType ->
+  IO (LLVMPtr sym PtrWidth)
+projectLLVM_pointer sym (RolledType vs) =
+  case vs^._2 of
+    VB (PE p (Ctx.Empty Ctx.:> RV blk Ctx.:> RV end Ctx.:> RV off)) ->
+      do addAssertion sym p PatternMatchFailureSimError
+         return (LLVMPtr blk end off)
+    _ -> addFailedAssertion sym PatternMatchFailureSimError
+
 
 -- | This provides a view of an address as a base + offset when possible.
 data AddrDecomposeResult sym w
@@ -53,6 +198,20 @@ data LLVMPtr sym w
 instance (IsSymInterface sym) => Eq (LLVMPtr sym w) where
   x == y = compare x y == EQ
 
+muxLLVMPtr ::
+  (1 <= w) =>
+  IsSymInterface sym =>
+  sym ->
+  Pred sym ->
+  LLVMPtr sym w ->
+  LLVMPtr sym w ->
+  IO (LLVMPtr sym w)
+muxLLVMPtr sym p (LLVMPtr b1 end1 off1) (LLVMPtr b2 end2 off2) =
+  do b   <- natIte sym p b1 b2
+     end <- bvIte sym p end1 end2
+     off <- bvIte sym p off1 off2
+     return $ LLVMPtr b end off
+
 -- | This is a syntactic ordering used for map lookups.
 instance (IsSymInterface sym) => Ord (LLVMPtr sym w) where
   compare (LLVMPtr b1 _ off1) (LLVMPtr b2 _ off2) =
@@ -65,16 +224,22 @@ instance (IsSymInterface sym) => Ord (LLVMPtr sym w) where
           GTF -> GT
           EQF -> EQ
 
+ptrToPtrVal :: LLVMPtr sym w -> LLVMVal sym w
+ptrToPtrVal (LLVMPtr blk end off) = LLVMValPtr blk end off
+
 data LLVMVal sym w where
+  -- NOTE! The block number '0' is special, and indicates that this value is actually a
+  -- bitvector of machine word width, rather than an acutal pointer!
   LLVMValPtr :: SymNat sym -> SymBV sym w -> SymBV sym w -> LLVMVal sym w
   LLVMValInt :: (1 <= x) => NatRepr x -> SymBV sym x -> LLVMVal sym w
   LLVMValReal :: SymReal sym -> LLVMVal sym w
   LLVMValStruct :: Vector (G.Field G.Type, LLVMVal sym w) -> LLVMVal sym w
   LLVMValArray :: G.Type -> Vector (LLVMVal sym w) -> LLVMVal sym w
 
+type PartLLVMVal sym w = PartExpr (Pred sym) (LLVMVal sym w)
 
-ptrConst :: (1 <= w, IsExprBuilder sym) => sym -> NatRepr w -> G.Size -> IO (SymBV sym w)
-ptrConst sym w x = bvLit sym w (fromIntegral x)
+ptrConst :: (1 <= w, IsExprBuilder sym) => sym -> NatRepr w -> G.Addr -> IO (SymBV sym w)
+ptrConst sym w x = bvLit sym w (G.bytesToInteger x)
 
 ptrDecompose :: (1 <= w, IsExprBuilder sym)
              => sym
@@ -208,8 +373,8 @@ applyCtorFLLVMVal sym _w ctor =
   case ctor of
     G.ConcatBV low_w  (PE p1 (LLVMValInt low_w' low))
                high_w (PE p2 (LLVMValInt high_w' high))
-       | fromIntegral (low_w*8)  == natValue low_w' &&
-         fromIntegral (high_w*8) == natValue high_w' ->
+       | G.bytesToBits low_w  == natValue low_w' &&
+         G.bytesToBits high_w == natValue high_w' ->
            do bv <- bvConcat sym high low
               Just LeqProof <- return $ isPosNat (addNat high_w' low_w')
               p <- andPred sym p1 p2
@@ -265,11 +430,17 @@ applyViewFLLVMVal
    -> NatRepr w
    -> G.ViewF (PartLLVMVal sym w)
    -> IO (PartLLVMVal sym w)
-applyViewFLLVMVal sym _wptr v =
+applyViewFLLVMVal sym wptr v =
   case v of
+    G.SelectLowBV low hi (PE p (LLVMValPtr blk _end off))
+      -> do p' <- andPred sym p =<< natEq sym blk =<< natLit sym 0
+            applyViewFLLVMVal sym wptr (G.SelectLowBV low hi (PE p' (LLVMValInt wptr off)))
+    G.SelectHighBV low hi (PE p (LLVMValPtr blk _end off))
+      -> do p' <- andPred sym p =<< natEq sym blk =<< natLit sym 0
+            applyViewFLLVMVal sym wptr (G.SelectHighBV low hi (PE p' (LLVMValInt wptr off)))
     G.SelectLowBV low hi (PE p (LLVMValInt w bv))
-      | Just (Some (low_w)) <- someNat (fromIntegral low)
-      , Just (Some (hi_w))  <- someNat (fromIntegral hi)
+      | Just (Some (low_w)) <- someNat (G.bytesToBits low)
+      , Just (Some (hi_w))  <- someNat (G.bytesToBits hi)
       , Just LeqProof <- isPosNat low_w
       , Just Refl <- testEquality (addNat low_w hi_w) w
       , Just LeqProof <- testLeq low_w w
@@ -277,8 +448,8 @@ applyViewFLLVMVal sym _wptr v =
         bv' <- bvSelect sym (knownNat :: NatRepr 0) low_w bv
         return $ PE p $ LLVMValInt low_w bv'
     G.SelectHighBV low hi (PE p (LLVMValInt w bv))
-      | Just (Some (low_w)) <- someNat (fromIntegral low)
-      , Just (Some (hi_w))  <- someNat (fromIntegral hi)
+      | Just (Some (low_w)) <- someNat (G.bytesToBits low)
+      , Just (Some (hi_w))  <- someNat (G.bytesToBits hi)
       , Just LeqProof <- isPosNat hi_w
       , Just Refl <- testEquality (addNat low_w hi_w) w
       -> do
