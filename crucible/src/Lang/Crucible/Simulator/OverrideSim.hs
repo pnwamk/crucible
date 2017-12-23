@@ -375,7 +375,7 @@ useIntrinsic hdl impl = FnBinding hdl (UseOverride (impl hdl))
 -- | Make an IntrinsicImpl from an explicit implementation
 mkIntrinsic
     :: forall p sym args ret
-     . (Ctx.CurryAssignmentClass args, KnownRepr TypeRepr ret)
+     . (Ctx.CurryAssignmentClass args)
     => (forall r. Proxy r
                -> sym
                -> Ctx.CurryAssignment args
@@ -385,7 +385,7 @@ mkIntrinsic
         -- reference to the symbolic engine, and a curried arguments
     -> FnHandle args ret
     -> Override p sym args ret
-mkIntrinsic m hdl = mkOverride (handleName hdl) ovr
+mkIntrinsic m hdl = mkOverride' (handleName hdl) (handleReturnType hdl) ovr
  where
    ovr :: forall r. OverrideSim p sym r args ret (RegValue sym ret)
    ovr = do
