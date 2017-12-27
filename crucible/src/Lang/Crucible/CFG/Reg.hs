@@ -345,7 +345,7 @@ data AtomValue ext s tp where
   -- Create a fresh reference cell
   NewRef :: !(Atom s tp) -> AtomValue ext s (ReferenceType tp)
   -- Create a fresh empty reference cell
-  NewEmptyRef :: !(TypeRepr tp) -> AtomValue s (ReferenceType tp)
+  NewEmptyRef :: !(TypeRepr tp) -> AtomValue ext s (ReferenceType tp)
 
   Call :: !(Atom s (FunctionHandleType args ret))
        -> !(Assignment (Atom s) args)
