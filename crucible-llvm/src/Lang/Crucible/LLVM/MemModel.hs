@@ -87,6 +87,7 @@ import           Control.Monad
 import           Control.Monad.IO.Class
 import           Control.Monad.ST
 import           Control.Monad.Trans.State
+import qualified Data.ByteString.UTF8 as UTF8 (toString)
 import           Data.Dynamic
 import           Data.List hiding (group)
 import           Data.IORef
@@ -317,9 +318,10 @@ allocGlobal :: (IsSymInterface sym, HasPtrWidth wptr)
             -> MemImpl sym
             -> (L.Symbol, G.Size)
             -> IO (MemImpl sym)
-allocGlobal sym mem (symbol@(L.Symbol sym_str), sz) = do
+allocGlobal sym mem (symbol@(L.Symbol name), sz) = do
   sz' <- bvLit sym PtrWidth (G.bytesToInteger sz)
-  (ptr, mem') <- doMalloc sym G.GlobalAlloc G.Mutable sym_str mem sz' -- TODO
+  let str = UTF8.toString name
+  (ptr, mem') <- doMalloc sym G.GlobalAlloc G.Mutable str mem sz' -- TODO
   return (registerGlobal mem' symbol ptr)
 
 -- | Add an entry to the global map of the given 'MemImpl'.

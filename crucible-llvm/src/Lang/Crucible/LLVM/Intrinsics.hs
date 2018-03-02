@@ -281,7 +281,7 @@ register_llvm_override llvmOverride = do
   llvmctx <- get
   let decl = llvmOverride_declare llvmOverride
   let nm@(L.Symbol str_nm) = L.decName decl
-  let fnm  = functionNameFromText (Text.pack str_nm)
+  let fnm  = functionNameFromText (Text.pack (UTF8.toString str_nm))
 
   sym <- lift $ getSymInterface
 

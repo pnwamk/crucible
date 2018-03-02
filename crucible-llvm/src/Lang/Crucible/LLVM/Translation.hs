@@ -103,6 +103,9 @@ import Control.Monad.Fail hiding (fail)
 import Control.Monad.State.Strict
 import Control.Lens hiding (op, (:>) )
 import Control.Monad.ST
+import Data.ByteString (ByteString)
+import qualified Data.ByteString as B (unpack)
+import qualified Data.ByteString.UTF8 as UTF8 (toString)
 import Data.Foldable (toList)
 import Data.Int
 import qualified Data.List as List
@@ -507,7 +510,7 @@ transValue ty@(IntType _) L.ValNull =
 transValue _ (L.ValString str) = do
   let eight = knownNat :: NatRepr 8
   let bv8   = LLVMPointerRepr eight
-  let chars = V.fromList $ map (BitvectorAsPointerExpr eight . App . BVLit eight . toInteger . fromEnum) $ str
+  let chars = V.fromList $ map (BitvectorAsPointerExpr eight . App . BVLit eight . toInteger) $ B.unpack str
   return $ BaseExpr (VectorRepr bv8) (App $ VectorLit bv8 $ chars)
 
 transValue _ (L.ValIdent i) = do
@@ -2273,7 +2276,7 @@ generateStmts retType lab stmts = go (processDbgDeclare stmts)
 processDbgDeclare :: [L.Stmt] -> [L.Stmt]
 processDbgDeclare = snd . go
   where
-    go :: [L.Stmt] -> (Map L.Ident [(String, L.ValMd)] , [L.Stmt])
+    go :: [L.Stmt] -> (Map L.Ident [(L.KindMd, L.ValMd)], [L.Stmt])
     go [] = (Map.empty, [])
     go (stmt : stmts) =
       let (m, stmts') = go stmts in
@@ -2298,23 +2301,21 @@ processDbgDeclare = snd . go
 
         _ -> (m, stmt : stmts')
 
-setLocation
-  :: [(String,L.ValMd)]
-  -> LLVMGenerator h s arch ret ()
+setLocation :: [(L.KindMd, L.ValMd)] -> LLVMGenerator h s arch ret ()
 setLocation [] = return ()
 setLocation (("dbg",L.ValMdLoc dl):_) = do
    let ln   = fromIntegral $ L.dlLine dl
        col  = fromIntegral $ L.dlCol dl
-       file = Text.pack $ findFile $ L.dlScope dl
+       file = Text.pack $ UTF8.toString $ findFile $ L.dlScope dl
     in setPosition (SourcePos file ln col)
 setLocation (("dbg",L.ValMdDebugInfo (L.DebugInfoSubprogram subp)) :_)
   | Just file' <- L.dispFile subp
   = do let ln = fromIntegral $ L.dispLine subp
-       let file = Text.pack $ findFile file'
+       let file = Text.pack $ UTF8.toString $ findFile file'
        setPosition (SourcePos file ln 0)
 setLocation (_:xs) = setLocation xs
 
-findFile :: (?lc :: TyCtx.LLVMContext) => L.ValMd -> String
+findFile :: (?lc :: TyCtx.LLVMContext) => L.ValMd -> ByteString
 findFile (L.ValMdRef x) =
   case TyCtx.lookupMetadata x of
     Just (L.ValMdNode (_:Just (L.ValMdRef y):_)) ->
@@ -2461,7 +2462,7 @@ insDeclareHandle halloc ctx decl = do
        let ?lc = ctx^.llvmTypeCtx
        args <- traverse liftMemType (L.decArgs decl)
        ret  <- liftRetType (L.decRetType decl)
-       let fn_name = functionNameFromText $ Text.pack sbl
+       let fn_name = functionNameFromText $ Text.pack (UTF8.toString sbl)
        let decl' = FunDecl
                    { fdRetType  = ret
                    , fdArgTypes = args
@@ -2529,6 +2530,6 @@ allocLLVMHandleInfo :: (IsSymInterface sym, HasPtrWidth wptr)
                     -> MemImpl sym
                     -> (L.Symbol, LLVMHandleInfo)
                     -> IO (MemImpl sym)
-allocLLVMHandleInfo sym mem (symbol@(L.Symbol sym_str), LLVMHandleInfo _ h) =
-  do (ptr, mem') <- doMallocHandle sym G.GlobalAlloc sym_str mem (SomeFnHandle h)
+allocLLVMHandleInfo sym mem (symbol@(L.Symbol name), LLVMHandleInfo _ h) =
+  do (ptr, mem') <- doMallocHandle sym G.GlobalAlloc (UTF8.toString name) mem (SomeFnHandle h)
      return (registerGlobal mem' symbol ptr)

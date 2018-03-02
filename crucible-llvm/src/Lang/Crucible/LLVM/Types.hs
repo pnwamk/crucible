@@ -38,6 +38,7 @@ module Lang.Crucible.LLVM.Types
 
 import           GHC.TypeLits
 import           Data.Typeable
+import qualified Data.ByteString.UTF8 as UTF8 (toString)
 
 import           Data.Parameterized.Context
 import           Data.Parameterized.NatRepr
@@ -52,7 +53,7 @@ newtype GlobalSymbol = GlobalSymbol L.Symbol
   deriving (Typeable, Eq, Ord, Show)
 
 globalSymbolName :: GlobalSymbol -> String
-globalSymbolName (GlobalSymbol (L.Symbol nm)) = nm
+globalSymbolName (GlobalSymbol (L.Symbol nm)) = UTF8.toString nm
 
 -- | The 'CrucibleType' of an LLVM memory. @'RegValue' sym 'Mem'@ is
 -- implemented as @'MemImpl' sym@.
