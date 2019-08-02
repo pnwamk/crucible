@@ -56,18 +56,18 @@ module Lang.Crucible.LLVM.Translation.Expr
   , callStore
   ) where
 
-import Control.Lens hiding ((:>))
-import Control.Monad
-import Control.Monad.Except
-import Data.Foldable (toList)
+import           Control.Lens hiding ((:>))
+import           Control.Monad
+import           Control.Monad.Except
+import           Data.Foldable (toList)
 import qualified Data.List as List
 --import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
-import Data.Sequence (Seq)
+import           Data.Sequence (Seq)
 import qualified Data.Sequence as Seq
-import Data.String
+import           Data.String
 import qualified Data.Vector as V
-import Numeric.Natural
+import           Numeric.Natural
 
 import qualified Data.Parameterized.Context as Ctx
 import           Data.Parameterized.Context ( pattern (:>) )
@@ -79,6 +79,7 @@ import qualified Text.LLVM.AST as L
 import qualified Lang.Crucible.CFG.Core as C
 import           Lang.Crucible.CFG.Expr
 import           Lang.Crucible.CFG.Generator
+import           What4.InterpretedFloatingPoint ( X86_80Val(..) )
 
 import           Lang.Crucible.LLVM.DataLayout
 import           Lang.Crucible.LLVM.Extension
@@ -319,6 +320,8 @@ liftConstant c = case c of
     return $ BaseExpr (FloatRepr SingleFloatRepr) (App (FloatLit f))
   DoubleConst d ->
     return $ BaseExpr (FloatRepr DoubleFloatRepr) (App (DoubleLit d))
+  LongDoubleConst (L.FP80_LongDouble e s) ->
+    return $ BaseExpr (FloatRepr X86_80FloatRepr) (App (FP80Lit $ X86_80Val e s))
   ArrayConst mt vs ->
     do vs' <- mapM liftConstant vs
        return (VecExpr mt $ Seq.fromList vs')
