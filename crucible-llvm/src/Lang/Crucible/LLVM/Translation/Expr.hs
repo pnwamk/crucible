@@ -253,7 +253,7 @@ zeroExpand (VecType n tp) k =
 zeroExpand (PtrType _tp) k = k PtrRepr nullPointerExpr
 zeroExpand FloatType   k  = k (FloatRepr SingleFloatRepr) (App (FloatLit 0))
 zeroExpand DoubleType  k  = k (FloatRepr DoubleFloatRepr) (App (DoubleLit 0))
-zeroExpand X86_FP80Type _ = k (FloatRepr X86_80FloatRepr) (App (FP80Lit 0))
+zeroExpand X86_FP80Type k = k (FloatRepr X86_80FloatRepr) (App (FP80Lit $ X86_80Val 0 0))
 zeroExpand MetadataType _ = ?err "Cannot zero expand metadata"
 
 undefExpand :: (?lc :: TypeContext, ?err :: String -> a, HasPtrWidth (ArchWidth arch))
