@@ -64,12 +64,12 @@ readString :: Parser Text
 readString = takeWhile1 isStringChar
 
 parseSExp :: Parser SExp
-parseSExp = do
+parseSExp =
   skipSpaceOrNewline
-  msum [ char '(' *> skipSpaceOrNewline *> (SApp <$> many parseSExp) <* skipSpaceOrNewline <* char ')'
-       , char '"' *> (SString <$> readString) <* char '"'
-       , SAtom <$> readToken
-       ]
+  >>  char '(' *> skipSpaceOrNewline *> (SApp <$> many parseSExp) <* skipSpaceOrNewline <* char ')'
+  <|> char '"' *> (SString <$> readString) <* char '"'
+  <|> SAtom <$> readToken
+
 
 stringToSExp :: Monad m => String -> m [SExp]
 stringToSExp s = do
