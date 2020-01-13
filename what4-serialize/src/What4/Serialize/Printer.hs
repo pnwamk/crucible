@@ -22,7 +22,6 @@ module What4.Serialize.Printer
   , convertBaseTypes
   , convertSymFn
   , convertSymFnEnv
-  , ParamLookup
   ) where
 
 import qualified Data.Foldable as F
@@ -50,7 +49,7 @@ import qualified What4.Expr.Builder as B
 import qualified What4.Expr.WeightedSum as WSum
 import qualified What4.Interface as S
 import qualified What4.Symbol as S
-import           What4.Utils.Util ( fromJust', SomeSome(..) )
+import           What4.Utils.Util ( SomeSome(..) )
 
 import           What4.Serialize.SETokens ( FAtom(..), printTokens'
                                           , ident', int', nat', string'
@@ -67,7 +66,7 @@ type SymFnEnv t = Map T.Text (SomeSome (S.ExprSymFn t))
 printSymFn' :: S.ExprSymFn t args ret -> (T.Text, SymFnEnv t)
 printSymFn' symfn =
   let
-    (sexp, fenv) = W.runWriter $ convertSymFn simpleParamLookup symfn
+    (sexp, fenv) = W.runWriter $ convertSymFn symfn
   in (printTokens' mempty sexp, fenv)
 
 printSymFn :: S.ExprSymFn t args ret -> T.Text
@@ -76,45 +75,41 @@ printSymFn = fst . printSymFn'
 printSymFnEnv :: [(T.Text, SomeSome (S.ExprSymFn t))] -> T.Text
 printSymFnEnv fenv =
   let
-    (sexp, _) = W.runWriter $ convertSymFnEnv simpleParamLookup fenv
+    (sexp, _) = W.runWriter $ convertSymFnEnv fenv
   in printTokens' mempty sexp
 
-simpleParamLookup :: forall t. ParamLookup t
-simpleParamLookup var = Just $ ident' (T.unpack (S.solverSymbolAsText (S.bvarName var)))
 
-
-convertSymFnEnv :: forall t. ParamLookup t -> [(T.Text, SomeSome (S.ExprSymFn t))] -> W.Writer (SymFnEnv t) SExp
-convertSymFnEnv paramLookup sigs = do
+convertSymFnEnv :: forall t. [(T.Text, SomeSome (S.ExprSymFn t))] -> W.Writer (SymFnEnv t) SExp
+convertSymFnEnv sigs = do
   sexpr <- mapM convertSomeSymFn $ sigs
   return $ SE.L [ ident' "symfnenv", SE.L sexpr ]
   where
     convertSomeSymFn :: (T.Text, SomeSome (S.ExprSymFn t)) -> W.Writer (SymFnEnv t) SExp
     convertSomeSymFn (name, SomeSome symFn) = do
-      sexpr <- convertSymFn paramLookup symFn
+      sexpr <- convertSymFn symFn
       return $ SE.L [ string' (T.unpack name), sexpr ]
 
-convertExprWithLet :: ParamLookup t -> S.Expr t tp -> W.Writer (SymFnEnv t) SExp
-convertExprWithLet paramLookup expr = do
+convertExprWithLet :: S.Expr t tp -> W.Writer (SymFnEnv t) SExp
+convertExprWithLet expr = do
   W.tell fenv
   return $ SE.L [SE.A (AIdent "let")
                 , bindings
                 , body
                 ]
   where ((body, bindings), _, fenv) = runMemo $ do
-          sexp <- convertExpr paramLookup expr
+          sexp <- convertExpr expr
           rawbindings <- OMap.assocs <$> RWS.get
-          let sexprs = map (\(idx, (_, sexp')) -> SE.L [ idxAtom idx, sexp' ]) (zip [0..] rawbindings)
+          let sexprs = map (\(key, sexp') -> SE.L [ letVar key, sexp' ]) rawbindings
           return $ (sexp, SE.L sexprs)
 
 convertSymFn :: forall t args ret
-              . ParamLookup t 
-             -> S.ExprSymFn t args ret
+              . S.ExprSymFn t args ret
              -> W.Writer (SymFnEnv t) SExp
-convertSymFn paramLookup symFn@(S.ExprSymFn _ symFnName symFnInfo _) = do
+convertSymFn symFn@(S.ExprSymFn _ symFnName symFnInfo _) = do
   sexpr <- case symFnInfo of
      S.DefinedFnInfo argVars expr _ -> do
        let sArgVars = SE.L $ reverse $ FC.toListFC getBoundVar argVars
-       sExpr <- convertExprWithLet paramLookup expr
+       sExpr <- convertExprWithLet expr
        let sArgTs = convertBaseTypes (S.fnArgTypes symFn)
        let sRetT = convertBaseType (S.fnReturnType symFn)
        return $ SE.L [ ident' "definedfn", sArgTs, sRetT, sArgVars, sExpr ]
@@ -132,11 +127,6 @@ convertSymFn paramLookup symFn@(S.ExprSymFn _ symFnName symFnInfo _) = do
            typeExpr = convertBaseType (B.bvarType var)
        in SE.L [ nameExpr, typeExpr ]
 
--- | Used for substituting in the result expression when a variable is
--- encountered in a definition.
-type ParamLookup t = forall tp. S.ExprBoundVar t tp -> Maybe SExp
-
-
 type Memo t a = RWS () (SymFnEnv t) (OMap SKey SExp) a
 
 runMemo ::  Memo t a -> (a, OMap SKey SExp, SymFnEnv t)
@@ -149,15 +139,14 @@ newtype SKey = SKey {sKeyValue :: Word64}
   deriving (Eq, Ord, Show)
 
 
-idxAtom :: Int -> SExp
-idxAtom idx = ident' $ "_g"++(show $ idx)
-
-skeyAtom :: SKey -> Memo t SExp
-skeyAtom key = do
-  cache <- RWS.get
-  case OMap.findIndex key cache of
-    Just idx -> return $ idxAtom idx
-    Nothing -> error $ "Unexpected missing key: " ++ show key
+-- | For the let-bound variables we introduce to keep things
+-- from exploding in size during serialization, we add the
+-- `@l` prefix to the noce id, so it is not a valid
+-- What4.Symbol.SolverSymbol and is globally unique (and
+-- thus should not clash with any crucible-generated
+-- variables or other let-bound variables).
+letVar :: SKey -> SExp
+letVar key = ident' $ "@l"++(show $ sKeyValue $ key)
 
 exprSKey :: S.Expr t tp -> Maybe SKey
 exprSKey x = SKey . Nonce.indexValue <$> B.exprMaybeId x
@@ -168,22 +157,21 @@ addKey key sexp = do
   cache <- RWS.get
   RWS.put (cache OMap.|> (key, sexp))
 
-convertExpr :: forall t tp . ParamLookup t -> S.Expr t tp -> Memo t SExp
-convertExpr paramLookup initialExpr = do
+convertExpr :: forall t tp . S.Expr t tp -> Memo t SExp
+convertExpr initialExpr = do
   case exprSKey initialExpr of
     Nothing -> go initialExpr
     Just key -> do
       cache <- RWS.get
       if OMap.member key cache
-        then do
-        skeyAtom key
+        then return $ letVar key
         else do
         sexp <- go initialExpr
         case sexp of
           SE.A _ -> return sexp -- don't memoize atomic s-expressions
           _ -> do 
             addKey key sexp
-            skeyAtom key
+            return $ letVar key
   where go :: S.Expr t tp -> Memo t SExp
         go (S.SemiRingLiteral S.SemiRingNatRepr val _) = return $ SE.A $ ANat val
         go (S.SemiRingLiteral S.SemiRingIntegerRepr val _) = return $ SE.A $ AInt val -- do we need/want these?
@@ -191,20 +179,26 @@ convertExpr paramLookup initialExpr = do
         go (S.SemiRingLiteral (S.SemiRingBVRepr _ sz) val _) = return $ SE.A (ABV (widthVal sz) val)
         go (S.StringExpr {}) = error "StringExpr is not supported"
         go (S.BoolExpr b _) = return $ bool' b
-        go (S.AppExpr appExpr) = convertAppExpr' paramLookup appExpr
+        go (S.AppExpr appExpr) = convertAppExpr' appExpr
         go (S.NonceAppExpr nae) =
           case S.nonceExprApp nae of
-            S.FnApp fn args -> convertFnApp paramLookup fn args
+            S.FnApp fn args -> convertFnApp fn args
             S.Forall {} -> error "Forall NonceAppExpr not supported"
             S.Exists {} -> error "Exists NonceAppExpr not supported"
             S.ArrayFromFn {} -> error "ArrayFromFn NonceAppExpr not supported"
             S.MapOverArrays {} -> error "MapOverArrays NonceAppExpr not supported"
             S.ArrayTrueOnEntries {} -> error "ArrayTrueOnEntries NonceAppExpr not supported"
-        go (S.BoundVarExpr var) = return $ fromJust' ("What4.Serialize.Printer paramLookup " ++ show (S.bvarName var)) $ paramLookup var
+        go (S.BoundVarExpr var) = return $ convertBoundVarExpr var
+
+-- | Serialize bound variables as the s-expression identifier `name_nonce`. This allows us to
+-- preserve their human-readable name while ensuring they are globally unique w/ the nonce suffix.
+convertBoundVarExpr :: forall t tp. S.ExprBoundVar t tp -> SExp
+convertBoundVarExpr x = ident' $ (T.unpack (S.solverSymbolAsText (S.bvarName x))) ++ "_" ++ (show $ S.bvarId x)
 
 
-convertAppExpr' :: forall t tp . ParamLookup t -> S.AppExpr t tp -> Memo t SExp
-convertAppExpr' paramLookup = go . S.appExprApp
+
+convertAppExpr' :: forall t tp . S.AppExpr t tp -> Memo t SExp
+convertAppExpr' = go . S.appExprApp
   where go :: forall tp' . S.App (S.Expr t) tp' -> Memo t SExp
         go (S.BaseIte _bt _ e1 e2 e3) = do
           s1 <- goE e1
@@ -378,7 +372,7 @@ convertAppExpr' paramLookup = go . S.appExprApp
                         , s]
 
         go (S.StructCtor _tps es) = do
-          ss <- convertExprAssignment paramLookup es
+          ss <- convertExprAssignment es
           return $ SE.L [ident' "struct", ss]
         go (S.StructField e ix _fieldTp) = do
           s <- goE e
@@ -389,14 +383,14 @@ convertAppExpr' paramLookup = go . S.appExprApp
 
         go (S.UpdateArray _ _ e1 es e2) = do
           s1 <- goE e1
-          ss <- convertExprAssignment paramLookup es
+          ss <- convertExprAssignment es
           s2 <- goE e2
           case ss of
             SE.RSList [idx] -> return $ SE.L [ ident' "updateArray", s1, idx, s2]
             _ -> error $ "multidimensional arrays not supported"
         go (S.SelectArray _ e es) = do
           s <- goE e
-          ss <- convertExprAssignment paramLookup es
+          ss <- convertExprAssignment es
           case ss of
             SE.RSList [idx] -> return $ SE.L [ ident' "select", s, idx]
             _ -> error $ "multidimensional arrays not supported"
@@ -407,7 +401,7 @@ convertAppExpr' paramLookup = go . S.appExprApp
         -- -- -- -- Helper functions! -- -- -- --
         
         goE :: forall tp' . S.Expr t tp' -> Memo t SExp
-        goE = convertExpr paramLookup
+        goE = convertExpr
 
         extend :: forall w. String -> Integer -> S.Expr t (BaseBVType w) -> Memo t SExp
         extend op r e = do
@@ -446,31 +440,29 @@ convertAppExpr' paramLookup = go . S.appExprApp
 
 
 convertExprAssignment ::
-  ParamLookup t
-  -> Ctx.Assignment (S.Expr t) sh
+  Ctx.Assignment (S.Expr t) sh
   -> Memo t SExp
-convertExprAssignment paramLookup es = case es of
+convertExprAssignment es = case es of
   Ctx.Empty -> return $ SE.Nil
   es' Ctx.:> e -> do
-    s <- convertExpr paramLookup e
-    ss <- convertExprAssignment paramLookup es'
+    s <- convertExpr e
+    ss <- convertExprAssignment es'
     return $ SE.cons s ss
 
 
 
 convertFnApp ::
-  ParamLookup t
-  -> S.ExprSymFn t args ret
+  S.ExprSymFn t args ret
   -> Ctx.Assignment (S.Expr t) args
   -> Memo t SExp
-convertFnApp paramLookup fn args
+convertFnApp fn args
   | name == "undefined"
   , BaseBVRepr nr <- S.fnReturnType fn = do
       let call = SE.L [ ident' "_", ident' "call", string' "uf.undefined" ]
       return $ SE.L [ call, int' (NR.intValue nr) ]
   | otherwise = do
     let call = SE.L [ ident' "_", ident' "call", string' (T.unpack $ fullname) ]
-    ss <- convertExprAssignment paramLookup args
+    ss <- convertExprAssignment args
     W.tell $ Map.singleton fullname (SomeSome fn)
     return $ SE.cons call ss
   where
