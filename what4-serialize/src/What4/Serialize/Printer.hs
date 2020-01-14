@@ -309,14 +309,17 @@ convertAppExpr' = go . W4.appExprApp
               return $ S.L [ ident "natle", s1, s2]
             W4.OrderedSemiRingRealRepr -> error $ "Printer: SemiRingLe is not supported for reals"
 
-        go (W4.BVOrBits pd) =
-          case WSum.prodRepr pd of
-            W4.SemiRingBVRepr _ w -> do
-              let pmul x y = return $ S.L [ ident "bvor", x, y ]
-              maybeS <- WSum.prodEvalM pmul goE pd
-              case maybeS of
-                Just s -> return s
-                Nothing -> return $ bitvec (natValue w) 0
+        go (W4.BVOrBits width bs) = do
+          let op = ident "bvor"
+          case W4.bvOrToList bs of
+            [] -> return $ bitvec (NR.natValue width) 0
+            (x:xs) -> do
+              e <- goE x
+              W.foldM (\acc b -> do
+                        b' <- goE b
+                        return $ S.L [op, b', acc])
+                e
+                xs
         go (W4.BVUdiv _ e1 e2) = do
           s1 <- goE e1
           s2 <- goE e2
