@@ -7,6 +7,7 @@
 module What4.Serialize.SETokens
     ( Atom(..)
     , string, ident, int, bitvec, bool, nat, real
+    , string', ident'
     , printAtom
     , printSExpr
     , parseSExpr
@@ -20,6 +21,7 @@ import qualified Data.SCargot.Repr as SC
 import qualified Data.SCargot.Repr.WellFormed as SC
 import           Data.Semigroup
 import qualified Data.Sequence as Seq
+import           Data.Text (Text)
 import qualified Data.Text as T
 import           Numeric.Natural ( Natural )
 import qualified Text.Parsec as P
@@ -29,8 +31,8 @@ import           Data.Ratio
 
 import           Prelude
 
-data Atom = AIdent String
-           | AString String
+data Atom = AId Text
+           | AStr Text
            | AInt Integer
            | ANat Natural
            | AReal Rational
@@ -40,12 +42,20 @@ data Atom = AIdent String
 
 type SExpr = SC.WellFormedSExpr Atom
 
-string :: String -> SExpr
-string = SC.A . AString
+string :: Text -> SExpr
+string = SC.A . AStr
+
+string' :: String -> SExpr
+string' = SC.A . AStr . T.pack
+
 
 -- | Lift an unquoted identifier.
-ident :: String -> SExpr
-ident = SC.A . AIdent
+ident :: Text -> SExpr
+ident = SC.A . AId
+
+ident' :: String -> SExpr
+ident' = SC.A . AId . T.pack
+
 
 -- | Lift a quoted identifier.
 -- quoted :: String -> SExpr
@@ -95,12 +105,12 @@ formatComment c
 printAtom :: Atom -> T.Text
 printAtom a =
   case a of
-    AIdent s -> T.pack s
+    AId s -> s
     --AQuoted s -> T.pack ('\'' : s)
-    AString s -> T.pack (show s)
+    AStr s -> T.pack (show s)
     AInt i -> T.pack (show i)
-    ANat n -> T.pack $ (show n)++"u"
-    AReal r -> T.pack $ (show (numerator r))++"/"++(show (denominator r))
+    ANat n -> T.pack $ "#u"++(show n)
+    AReal r -> T.pack $ "#r"++(show (numerator r))++"/"++(show (denominator r))
     ABV w val -> formatBV w val
     ABool b -> if b then "#true" else "#false"
 
@@ -118,18 +128,44 @@ formatBV w val = T.pack (prefix ++ printf fmt val)
 -- | This is only the base-level parsing of atoms.  The full language
 -- parsing is handled by the base here and the Parser definitions.
 
-parseIdent :: Parser String
-parseIdent = (:) <$> first <*> P.many rest
+parseId :: Parser Text
+parseId = T.pack <$> ((:) <$> first <*> P.many rest)
   where first = P.letter P.<|> P.oneOf "@+-=<>_."
         rest = P.letter P.<|> P.digit P.<|> P.oneOf "+-=<>_."
 
-parseString :: Parser String
-parseString = do
+parseStr :: Parser Text
+parseStr = do
   _ <- P.char '"'
   s <- P.many (P.noneOf ['"'])
   _ <- P.char '"'
-  return s
+  return $ T.pack s
 
+parseReal :: Parser Rational
+parseReal = do
+  _ <- P.string "#r"
+  n <- (read :: (String -> Integer)) <$> P.many P.digit
+  _ <- P.char '/'
+  d <- (read :: (String -> Integer)) <$> P.many P.digit
+  return $ n % d
+
+parseInt :: Parser Integer
+parseInt = do
+  (read <$> P.many1 P.digit)
+  P.<|> (*(-1)) . read <$> (P.char '-' >> P.many1 P.digit)
+
+
+
+parseNat :: Parser Natural
+parseNat = do
+  _ <- P.string "#u"
+  n <- P.many1 P.digit
+  return $ read n
+
+parseBool :: Parser Bool
+parseBool = do 
+  (P.try (P.string "#false" *> return False))
+  P.<|> (P.string "#true" *> return True)
+  
 parseBV :: Parser (Int, Integer)
 parseBV = P.char '#' >> ((P.char 'b' >> parseBin) P.<|> (P.char 'x' >> parseHex))
   where parseBin = P.oneOf "10" >>= \d -> parseBin' (1, if d == '1' then 1 else 0)
@@ -144,16 +180,12 @@ parseBV = P.char '#' >> ((P.char 'b' >> parseBin) P.<|> (P.char 'x' >> parseHex)
 
 parseAtom :: Parser Atom
 parseAtom
-  =     ANat . read <$> P.try (P.many1 P.digit <* P.char 'u')
-  -- P.<|> AReal . read <$> P.try (P.many1 P.digit <* P.char 'r') -- TODO parse `X/Y` as a real
-  P.<|> AInt . read <$> P.many1 P.digit
-  P.<|> AInt . (*(-1)) . read <$> (P.char '-' >> P.many1 P.digit)
-  P.<|> AIdent      <$> parseIdent
-  --P.<|> AQuoted     <$> (P.char '\'' >> parseIdent)
-  P.<|> AString     <$> parseString
-  P.<|> ABool       <$> P.try (P.try (P.string "#false" *> return False)
-                               P.<|>
-                               (P.string "#true" *> return True))
+  =     ANat  <$> parseNat
+  P.<|> AReal <$> parseReal 
+  P.<|> AInt  <$> parseInt
+  P.<|> AId   <$> parseId
+  P.<|> AStr  <$> parseStr
+  P.<|> ABool <$> parseBool
   P.<|> uncurry ABV <$> parseBV
 
 parseSExpr :: T.Text -> Either String SExpr

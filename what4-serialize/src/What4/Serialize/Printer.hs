@@ -14,31 +14,34 @@
 
 module What4.Serialize.Printer
   (
-    printSymFn'
-  , printSymFn
-  , printSymFnEnv
-  , convertExprWithLet
-  , convertBaseType
-  , convertBaseTypes
-  , convertSymFn
-  , convertSymFnEnv
+    serializeExpr
+  , serializeExpr'
+  , serializeSymFn
+  , serializeSymFn'
+  , serializeBaseType
+  , Config(..)
+  , printSExpr
+  , defaultConfig
   ) where
 
+import           Numeric.Natural
 import qualified Data.Foldable as F
-import           Data.Map ( Map )
-import qualified Data.Map as Map
+import           Data.Set ( Set )
+import qualified Data.Set as Set
 import           Data.Map.Ordered (OMap)
 import qualified Data.Map.Ordered as OMap
+import           Data.Parameterized.Some
 import qualified Data.Parameterized.Context as Ctx
 import qualified Data.Parameterized.NatRepr as NR
 import qualified Data.Parameterized.Nonce as Nonce
 import qualified Data.Parameterized.TraversableFC as FC
+
+import           Data.Text (Text)
 import qualified Data.Text as T
 import           Data.Word ( Word64 )
-import           Control.Monad.Trans.RWS.Strict ( RWS )
-import qualified Control.Monad.Trans.RWS.Strict as RWS
-
-import qualified Control.Monad.Writer as W
+import qualified Control.Monad as M
+import           Control.Monad.State.Strict (State)
+import qualified Control.Monad.State.Strict as MS
 
 import qualified Data.SCargot.Repr.WellFormed as S
 
@@ -49,132 +52,328 @@ import qualified What4.Expr.Builder as W4
 import qualified What4.Expr.WeightedSum as WSum
 import qualified What4.Interface as W4
 import qualified What4.Symbol as W4
-import           What4.Utils.Util ( SomeSome(..) )
+
 
 import           What4.Serialize.SETokens ( Atom(..), printSExpr
                                           , ident, int, string
                                           , bitvec, bool, nat, real
                                           )
 
-type SExp = S.WellFormedSExpr Atom
-type SymFnEnv t = Map T.Text (SomeSome (W4.ExprSymFn t))
+type SExpr = S.WellFormedSExpr Atom
+
+-- | Like 'Data.Parameterized.Some.Some', but for doubly-parameterized types.
+data SomeSymFn t = forall dom ret. SomeSymFn (W4.ExprSymFn t dom ret)
+
+instance Eq (SomeSymFn t) where
+  (SomeSymFn fn1) == (SomeSymFn fn2) =
+    case W4.testEquality (W4.symFnId fn1) (W4.symFnId fn2) of
+      Just _ -> True
+      _ -> False
+
+
+instance Ord (SomeSymFn t) where
+  compare (SomeSymFn fn1) (SomeSymFn fn2) =
+    compare (Nonce.indexValue $ W4.symFnId fn1) (Nonce.indexValue $ W4.symFnId fn2) 
+
+
+type VarNameEnv t = OMap (Some (W4.ExprBoundVar t)) Text
+type FnNameEnv t  = OMap (SomeSymFn t) Text
+
+
+
+-- | Controls how expressions and functions are serialized.
+data Config =
+  Config
+  { cfgAllowFreeVars :: Bool
+  -- ^ When @True@, any free What4 @ExprBoundVar@
+  -- encountered is simply serialized with a unique name,
+  -- and the mapping from What4 ExprBoundVar to unique names
+  -- is returned after serialization. When False, an error
+  -- is raised when a "free" @ExprBoundVar@ is encountered.
+  , cfgAllowFreeSymFns :: Bool
+  -- ^ When @True@, any encountered What4 @ExprSymFn@ during
+  -- serialization is simply assigned a unique name and the
+  -- mapping from What4 ExprSymFn to unique name is returned
+  -- after serialization. When @False, encountered
+  -- ExprSymFns are serialized at the top level of the
+  -- expression in a `(letfn ([f ...]) ...)`.
+  }
+
+data Result t =
+  Result
+  { resSExpr :: S.WellFormedSExpr Atom
+  , resFreeVarEnv :: VarNameEnv t
+  , resFreeSymFnEnv :: FnNameEnv t
+  }
+
+
+defaultConfig :: Config
+defaultConfig = Config { cfgAllowFreeVars = False, cfgAllowFreeSymFns = False}
 
 -- This file is organized top-down, i.e., from high-level to low-level.
 
--- | Serialize the given What4 ExprSymFn as an s-expression, and return
--- the binding environment of its function calls.
-printSymFn' :: W4.ExprSymFn t args ret -> (T.Text, SymFnEnv t)
-printSymFn' symfn =
-  let
-    (sexp, fenv) = W.runWriter $ convertSymFn symfn
-  in (printSExpr mempty sexp, fenv)
+-- | Serialize a What4 Expr as a well-formed s-expression
+-- (i.e., one which contains no improper lists). Equivalent
+-- to @(resSExpr (serializeExpr' defaultConfig))@. Sharing
+-- in the AST is achieved via a top-level let-binding around
+-- the emitted expression (unless there are no terms with
+-- non-atomic terms which can be shared).
+serializeExpr :: W4.Expr t tp -> SExpr
+serializeExpr = resSExpr . (serializeExpr' defaultConfig)
 
-printSymFn :: W4.ExprSymFn t args ret -> T.Text
-printSymFn = fst . printSymFn'
+-- | Serialize a What4 Expr as a well-formed s-expression
+-- (i.e., one which contains no improper lists) according to
+-- the configuration. Sharing in the AST is achieved via a
+-- top-level let-binding around the emitted expression
+-- (unless there are no terms with non-atomic terms which
+-- can be shared).
+serializeExpr' :: Config -> W4.Expr t tp -> Result t
+serializeExpr' cfg expr = serializeSomething cfg (convertExprWithLet expr)
 
-printSymFnEnv :: [(T.Text, SomeSome (W4.ExprSymFn t))] -> T.Text
-printSymFnEnv fenv =
-  let
-    (sexp, _) = W.runWriter $ convertSymFnEnv fenv
-    comments = mempty
-  in printSExpr comments sexp
+-- | Serialize a What4 ExprSymFn as a well-formed
+-- s-expression (i.e., one which contains no improper
+-- lists). Equivalent to @(resSExpr (serializeSymFn'
+-- defaultConfig))@. Sharing in the AST is achieved via a
+-- top-level let-binding around the emitted expression
+-- (unless there are no terms with non-atomic terms which
+-- can be shared).
+serializeSymFn :: W4.ExprSymFn t dom ret -> SExpr
+serializeSymFn = resSExpr . (serializeSymFn' defaultConfig)
 
 
-convertSymFnEnv :: forall t. [(T.Text, SomeSome (W4.ExprSymFn t))] -> W.Writer (SymFnEnv t) SExp
-convertSymFnEnv sigs = do
-  sexpr <- mapM convertSomeSymFn $ sigs
-  return $ S.L [ ident "symfnenv", S.L sexpr ]
+-- | Serialize a What4 ExprSymFn as a well-formed
+-- s-expression (i.e., one which contains no improper lists)
+-- according to the configuration. Sharing in the AST is
+-- achieved via a top-level let-binding around the emitted
+-- expression (unless there are no terms with non-atomic
+-- terms which can be shared).
+serializeSymFn' :: Config -> W4.ExprSymFn t dom ret -> Result t
+serializeSymFn' cfg fn = serializeSomething cfg (convertSymFn fn)
+
+-- | Run the given Memo computation to produce a well-formed
+-- s-expression (i.e., one which contains no improper lists)
+-- according to the configuration. Sharing in the AST is
+-- achieved via a top-level let-binding around the emitted
+-- expression (unless there are no terms with non-atomic
+-- terms which can be shared).
+serializeSomething :: Config -> Memo t SExpr -> Result t
+serializeSomething cfg something =
+  let (maybeLetFn, getFreeSymFnEnv) = if cfgAllowFreeSymFns cfg
+                                      then (return, envFreeSymFnEnv)
+                                      else (letFn, \_ -> OMap.empty)
+      (sexpr, menv) = runMemo cfg $ something >>= maybeLetFn
+      letBindings = map (\(varName, boundExpr) -> S.L [ ident varName, boundExpr ])
+                    $ map snd
+                    $ OMap.assocs
+                    $ envLetBindings menv
+      res = mkLet letBindings sexpr
+    in Result { resSExpr = res
+              , resFreeVarEnv = envFreeVarEnv menv
+              , resFreeSymFnEnv = getFreeSymFnEnv menv
+              }
+
+
+serializeBaseType :: BaseTypeRepr tp -> SExpr
+serializeBaseType bt = convertBaseType bt
+
+data MemoEnv t =
+  MemoEnv
+  { envConfig :: !Config
+  -- ^ User provided configuration for serialization.
+  , envIdCounter :: !Natural
+  -- ^ Internal counter for generating fresh names
+  , envLetBindings :: !(OMap SKey (Text, SExpr))
+  -- ^ Mapping from What4 expression nonces to the
+  -- corresponding let-variable name (the @fst@) and the
+  -- corresponding bound term (the @snd@).
+  , envFreeVarEnv :: !(VarNameEnv t)
+  -- ^ Mapping from What4 ExprBoundVar to the fresh names
+  -- assigned to them for serialization purposes.
+  , envFreeSymFnEnv :: !(FnNameEnv t)
+  -- ^ Mapping from What4 ExprSymFn to the fresh names
+  -- assigned to them for serialization purposes.
+  , envBoundVars :: Set (Some (W4.ExprBoundVar t))
+  -- ^ Set of currently in-scope What4 ExprBoundVars (i.e.,
+  -- ExprBoundVars for whom we are serializing the body of
+  -- their binding form).
+  }
+
+initEnv :: forall t . Config -> MemoEnv t
+initEnv cfg = MemoEnv { envConfig = cfg
+                      , envIdCounter = 0
+                      , envLetBindings = OMap.empty
+                      , envFreeVarEnv = OMap.empty
+                      , envFreeSymFnEnv = OMap.empty
+                      , envBoundVars = Set.empty
+                      }
+
+type Memo t a = State (MemoEnv t) a
+
+runMemo :: Config -> (Memo t a) -> (a, MemoEnv t)
+runMemo cfg m = MS.runState m $ initEnv cfg
+
+
+-- | Serialize the given sexpression within a `letfn` which
+-- serializes and binds all of the encountered SymFns. Note:
+-- this recursively also discovers and then serializes
+-- SymFns referenced within the body of the SymFns
+-- encountered thus far.
+letFn :: SExpr -> Memo t SExpr
+letFn sexpr = go [] [] Set.empty
   where
-    convertSomeSymFn :: (T.Text, SomeSome (W4.ExprSymFn t)) -> W.Writer (SymFnEnv t) SExp
-    convertSomeSymFn (name, SomeSome symFn) = do
-      sexpr <- convertSymFn symFn
-      return $ S.L [ string (T.unpack name), sexpr ]
+    go :: [((SomeSymFn t), Text)] -> [(Text, SExpr)] -> Set Text ->  Memo t SExpr
+    go [] fnBindings seen = do
+      -- Although the `todo` list is empty, we may have
+      -- encountered some SymFns along the way, so check for
+      -- those and serialize any previously unseen SymFns.
+      newFns <- MS.gets (filter (\(_symFn, varName) -> not $ Set.member varName seen)
+                         . OMap.assocs
+                         . envFreeSymFnEnv)
+      if null newFns
+        then if null fnBindings
+             then return sexpr
+             else let bs = map (\(name, def) -> S.L [ident name, def]) fnBindings
+                  in return $ S.L [ident "letfn" , S.L bs, sexpr]
+        else go newFns fnBindings seen
+    go (((SomeSymFn nextFn), nextFnName):todo) fnBindings seen = do
+      nextSExpr <- convertSymFn nextFn
+      let fnBindings' = (nextFnName, nextSExpr):fnBindings
+          seen' = Set.insert nextFnName seen
+      go todo fnBindings' seen'
 
-convertExprWithLet :: W4.Expr t tp -> W.Writer (SymFnEnv t) SExp
+
+-- | Converts the given What4 expression into an
+-- s-expression and clears the let-binding cache (since it
+-- just emitted a let binding with any necessary let-bound
+-- vars).
+convertExprWithLet :: W4.Expr t tp -> Memo t SExpr
 convertExprWithLet expr = do
-  W.tell fenv
-  return $ S.L [ ident "let"
-               , bindings
-               , body
-               ]
-  where ((body, bindings), _, fenv) = runMemo $ do
-          sexp <- convertExpr expr
-          rawbindings <- OMap.assocs <$> RWS.get
-          let sexprs = map (\(key, sexp') -> S.L [ letVar key, sexp' ]) rawbindings
-          return $ (sexp, S.L sexprs)
+  b <- convertExpr expr
+  bs <- map (\(varName, boundExpr) -> S.L [ ident varName, boundExpr ])
+        <$> map snd
+        <$> OMap.assocs
+        <$> MS.gets envLetBindings
+  MS.modify' (\r -> r {envLetBindings = OMap.empty})
+  return $ mkLet bs b
 
+mkLet :: [SExpr] -> SExpr -> SExpr
+mkLet [] body       = body
+mkLet bindings body = S.L [ident "let", S.L bindings, body]
+
+
+-- | Converts a What4 ExprSymFn into an s-expression within
+-- the Memo monad (i.e., no `let` or `letfn`s are emitted).
 convertSymFn :: forall t args ret
               . W4.ExprSymFn t args ret
-             -> W.Writer (SymFnEnv t) SExp
+             -> Memo t SExpr
 convertSymFn symFn@(W4.ExprSymFn _ symFnName symFnInfo _) = do
-  sexpr <- case symFnInfo of
-     W4.DefinedFnInfo argVars expr _ -> do
-       let sArgVars = S.L $ reverse $ FC.toListFC getBoundVar argVars
-       sExpr <- convertExprWithLet expr
-       let sArgTs = convertBaseTypes (W4.fnArgTypes symFn)
-       let sRetT = convertBaseType (W4.fnReturnType symFn)
-       return $ S.L [ ident "definedfn", sArgTs, sRetT, sArgVars, sExpr ]
-     W4.UninterpFnInfo argTs retT ->
-       let
-         sArgTs = convertBaseTypes argTs
+ case symFnInfo of
+   W4.DefinedFnInfo argVars body _ -> do
+     let sArgTs = convertBaseTypes (W4.fnArgTypes symFn)
+         sRetT = convertBaseType (W4.fnReturnType symFn)
+     argsWithFreshNames <- let rawArgs = reverse $ FC.toListFC Some argVars
+                           in mapM getBoundVarWithFreshName rawArgs
+     let (origBoundVars, freshArgNames) = unzip argsWithFreshNames
+     -- Convert the body with the bound variable set and
+     -- free-variable mapping extended to reflect being
+     -- under the function's binders.
+     sExpr <- MS.withState (\ms -> let boundVars = envBoundVars ms
+                                       fvEnv = envFreeVarEnv ms
+                             in ms { envBoundVars = Set.union boundVars (Set.fromList origBoundVars)
+                                   , envFreeVarEnv = fvEnv OMap.<>| (OMap.fromList argsWithFreshNames)})
+              $ convertExprWithLet body
+     return $ S.L [ ident "definedfn"
+                  , string $ W4.solverSymbolAsText symFnName
+                  , S.L ((ident "->"):sArgTs ++ [sRetT])
+                  , S.L $ map ident freshArgNames
+                  , sExpr
+                  ]
+   W4.UninterpFnInfo argTs retT ->
+     let sArgTs = convertBaseTypes argTs
          sRetT = convertBaseType retT
-       in return $ S.L [ ident "uninterpfn", sArgTs, sRetT]
-     _ -> error "Unsupported ExprSymFn kind in convertSymFn"
-  return $ S.L [ ident "symfn", string (T.unpack $ W4.solverSymbolAsText symFnName), sexpr ]
+     in return $ S.L [ ident "uninterpfn"
+                     , string $ W4.solverSymbolAsText symFnName
+                     , S.L ((ident "->"):sArgTs ++ [sRetT])
+                     ]
+   W4.MatlabSolverFnInfo _msfn _argTs _body ->
+     error "MatlabSolverFnInfo SymFns are not yet supported"
   where
-    getBoundVar :: forall tp. W4.ExprBoundVar t tp -> SExp
-    getBoundVar var =
-       let nameExpr = ident (T.unpack (W4.solverSymbolAsText (W4.bvarName var)))
-           typeExpr = convertBaseType (W4.bvarType var)
-       in S.L [ nameExpr, typeExpr ]
-
-type Memo t a = RWS () (SymFnEnv t) (OMap SKey SExp) a
-
-runMemo ::  Memo t a -> (a, OMap SKey SExp, SymFnEnv t)
-runMemo m = RWS.runRWS m () OMap.empty
+    getBoundVarWithFreshName ::
+      (Some (W4.ExprBoundVar t)) ->
+      Memo t (Some (W4.ExprBoundVar t), Text)
+    getBoundVarWithFreshName someVar@(Some var) = do
+      nm <- freshName (W4.bvarType var)
+      return (someVar, nm)
 
 
--- | Key for sharing SExp construction. Internally indexes are expression nonces,
+-- | Key for sharing SExpr construction. Internally indexes are expression nonces,
 -- but the let-binding identifiers are based on insertion order to the OMap
 newtype SKey = SKey {sKeyValue :: Word64}
   deriving (Eq, Ord, Show)
 
 
--- | For the let-bound variables we gensym/introduce to keep
--- things from exploding in size during serialization, we
--- add the `@l` prefix to the noce id, so it is not a valid
--- What4.Symbol.SolverSymbol and is globally unique (and
--- thus should not clash with any crucible-generated
--- variables or other let-bound variables).
-letVar :: SKey -> SExp
-letVar key = ident $ "@l"++(show $ sKeyValue $ key)
+
+freshName :: W4.BaseTypeRepr tp -> Memo t Text
+freshName tp = do
+  idCount <- MS.gets envIdCounter
+  MS.modify' $ (\e -> e {envIdCounter = idCount + 1})
+  let prefix = case tp of
+                 W4.BaseBoolRepr{} -> "bool"
+                 W4.BaseNatRepr{} -> "nat"
+                 W4.BaseIntegerRepr{} -> "int"
+                 W4.BaseRealRepr{} -> "real"
+                 W4.BaseFloatRepr{} -> "fl"
+                 W4.BaseStringRepr{} -> "str"
+                 W4.BaseComplexRepr -> "cmplx"
+                 W4.BaseBVRepr{} -> "bv"
+                 W4.BaseStructRepr{} -> "struct"
+                 W4.BaseArrayRepr{} -> "arr"
+  return $ T.pack $ prefix++(show $ idCount)
+
+freshFnName :: W4.ExprSymFn t args ret -> Memo t Text
+freshFnName fn = do
+  idCount <- MS.gets envIdCounter
+  MS.modify' $ (\e -> e {envIdCounter = idCount + 1})
+  let prefix = case W4.symFnInfo fn of 
+                 W4.UninterpFnInfo{} -> "ufn"
+                 W4.DefinedFnInfo{} -> "dfn"
+                 W4.MatlabSolverFnInfo{} -> "mfn"
+  return $ T.pack $ prefix++(show $ idCount)
+
+
 
 exprSKey :: W4.Expr t tp -> Maybe SKey
 exprSKey x = SKey . Nonce.indexValue <$> W4.exprMaybeId x
 
--- | Don't overwrite cache entries, since the ordering needs to be preserved
-addKey :: SKey -> SExp -> Memo t ()
-addKey key sexp = do
-  cache <- RWS.get
-  RWS.put (cache OMap.|> (key, sexp))
+-- | Allocate a fresh variable for the given
+-- nonce-key/s-expression and save the variable/expression
+-- mapping in the Memo monad.
+addLetBinding :: SKey -> SExpr -> W4.BaseTypeRepr tp -> Memo t Text
+addLetBinding key sexp tp = do
+  letVarName <- freshName tp
+  curLetBindings <- MS.gets envLetBindings
+  MS.modify' $ (\e -> e {envLetBindings =  curLetBindings OMap.|> (key, (letVarName, sexp))})
+  return letVarName
 
-convertExpr :: forall t tp . W4.Expr t tp -> Memo t SExp
+-- | Converts a What 4 expression into an s-expression
+-- within the Memo monad (i.e., no `let` or `letfn`s are
+-- emitted in the result).
+convertExpr :: forall t tp . W4.Expr t tp -> Memo t SExpr
 convertExpr initialExpr = do
   case exprSKey initialExpr of
     Nothing -> go initialExpr
     Just key -> do
-      cache <- RWS.get
-      if OMap.member key cache
-        then return $ letVar key
-        else do
-        sexp <- go initialExpr
-        case sexp of
-          S.A _ -> return sexp -- don't memoize atomic s-expressions
-          _ -> do 
-            addKey key sexp
-            return $ letVar key
-  where go :: W4.Expr t tp -> Memo t SExp
-        -- TODO / FIXME - we need to serialize integers, nates, reals, etc differently
+      letCache <- MS.gets envLetBindings
+      case OMap.lookup key letCache of
+        Just (name, _) -> return $ ident name
+        Nothing -> do
+          sexp <- go initialExpr
+          case sexp of
+            S.A _ -> return sexp -- Don't memoize atomic s-expressions - that's just silly.
+            _ -> do 
+              letVarName <- addLetBinding key sexp (W4.exprType initialExpr)
+              return $ ident letVarName
+  where go :: W4.Expr t tp -> Memo t SExpr
         go (W4.SemiRingLiteral W4.SemiRingNatRepr val _) = return $ nat val
         go (W4.SemiRingLiteral W4.SemiRingIntegerRepr val _) = return $ int val -- do we need/want these?
         go (W4.SemiRingLiteral W4.SemiRingRealRepr val _) = return $ real val
@@ -185,23 +384,40 @@ convertExpr initialExpr = do
         go (W4.NonceAppExpr nae) =
           case W4.nonceExprApp nae of
             W4.FnApp fn args -> convertFnApp fn args
-            W4.Forall {} -> error "Forall NonceAppExpr not supported"
-            W4.Exists {} -> error "Exists NonceAppExpr not supported"
-            W4.ArrayFromFn {} -> error "ArrayFromFn NonceAppExpr not supported"
-            W4.MapOverArrays {} -> error "MapOverArrays NonceAppExpr not supported"
-            W4.ArrayTrueOnEntries {} -> error "ArrayTrueOnEntries NonceAppExpr not supported"
-        go (W4.BoundVarExpr var) = return $ convertBoundVarExpr var
+            W4.Forall {} -> error "Forall NonceAppExpr not yet supported"
+            W4.Exists {} -> error "Exists NonceAppExpr not yet supported"
+            W4.ArrayFromFn {} -> error "ArrayFromFn NonceAppExpr not yet supported"
+            W4.MapOverArrays {} -> error "MapOverArrays NonceAppExpr not yet supported"
+            W4.ArrayTrueOnEntries {} -> error "ArrayTrueOnEntries NonceAppExpr not yet supported"
+        go (W4.BoundVarExpr var) = convertBoundVarExpr var
 
 -- | Serialize bound variables as the s-expression identifier `name_nonce`. This allows us to
 -- preserve their human-readable name while ensuring they are globally unique w/ the nonce suffix.
-convertBoundVarExpr :: forall t tp. W4.ExprBoundVar t tp -> SExp
-convertBoundVarExpr x = ident $ (T.unpack (W4.solverSymbolAsText (W4.bvarName x))) ++ "_" ++ (show $ W4.bvarId x)
+convertBoundVarExpr :: forall t tp. W4.ExprBoundVar t tp -> Memo t SExpr
+convertBoundVarExpr x = do
+  fvsAllowed <- MS.gets (cfgAllowFreeVars . envConfig)
+  bvs <- MS.gets envBoundVars
+  -- If this variable is not bound (in the standard syntactic sense)
+  -- and free variables are not explicitly permitted, raise an error.
+  MS.when ((not $ Set.member (Some x) bvs) && (not fvsAllowed)) $
+    error $
+    "encountered the free What4 ExprBoundVar `"
+    ++ (T.unpack (W4.solverSymbolAsText (W4.bvarName x)))
+    ++ "`, but the user-specified configuration dissallows free variables."
+  -- Get the renaming cache and either use the name already generated
+  -- or generate a fresh name and record it.
+  varEnv <- MS.gets envFreeVarEnv
+  case OMap.lookup (Some x) varEnv of
+    Just var -> return $ ident var
+    Nothing -> do
+      varName <- freshName $ W4.bvarType x
+      MS.modify' $ (\e -> e {envFreeVarEnv = varEnv OMap.|> ((Some x), varName)})
+      return $ ident varName
 
 
-
-convertAppExpr' :: forall t tp . W4.AppExpr t tp -> Memo t SExp
+convertAppExpr' :: forall t tp . W4.AppExpr t tp -> Memo t SExpr
 convertAppExpr' = go . W4.appExprApp
-  where go :: forall tp' . W4.App (W4.Expr t) tp' -> Memo t SExp
+  where go :: forall tp' . W4.App (W4.Expr t) tp' -> Memo t SExpr
         go (W4.BaseIte _bt _ e1 e2 e3) = do
           s1 <- goE e1
           s2 <- goE e2
@@ -315,11 +531,10 @@ convertAppExpr' = go . W4.appExprApp
             [] -> return $ bitvec (NR.natValue width) 0
             (x:xs) -> do
               e <- goE x
-              W.foldM (\acc b -> do
-                        b' <- goE b
-                        return $ S.L [op, b', acc])
-                e
-                xs
+              let f = (\acc b -> do
+                          b' <- goE b
+                          return $ S.L [op, b', acc])
+              M.foldM f e xs
         go (W4.BVUdiv _ e1 e2) = do
           s1 <- goE e1
           s2 <- goE e2
@@ -405,10 +620,10 @@ convertAppExpr' = go . W4.appExprApp
 
         -- -- -- -- Helper functions! -- -- -- --
         
-        goE :: forall tp' . W4.Expr t tp' -> Memo t SExp
+        goE :: forall tp' . W4.Expr t tp' -> Memo t SExpr
         goE = convertExpr
 
-        extend :: forall w. String -> Integer -> W4.Expr t (BaseBVType w) -> Memo t SExp
+        extend :: forall w. Text -> Integer -> W4.Expr t (BaseBVType w) -> Memo t SExpr
         extend op r e = do
           let w = case W4.exprType e of BaseBVRepr len -> intValue len
               extension = r - w
@@ -417,14 +632,14 @@ convertAppExpr' = go . W4.appExprApp
                         , s
                         ]
 
-        extract :: forall tp'. Integer -> Integer -> W4.Expr t tp' -> Memo t SExp
+        extract :: forall tp'. Integer -> Integer -> W4.Expr t tp' -> Memo t SExpr
         extract i j bv = do
           s <- goE bv
           return $ S.L [ S.L [ ident "_", ident "extract", int i, int j ]
                         , s
                         ]
 
-        convertBoolMap :: String -> Bool -> BooM.BoolMap (W4.Expr t) -> Memo t SExp
+        convertBoolMap :: Text -> Bool -> BooM.BoolMap (W4.Expr t) -> Memo t SExpr
         convertBoolMap op base bm =
           let strBase b = if b
                           then S.L [ident "=", bitvec 1 0, bitvec 1 0]  -- true
@@ -446,7 +661,7 @@ convertAppExpr' = go . W4.appExprApp
 
 convertExprAssignment ::
   Ctx.Assignment (W4.Expr t) sh
-  -> Memo t [SExp]
+  -> Memo t [SExpr]
 convertExprAssignment es =
   case es of
     Ctx.Empty -> return $ []
@@ -460,47 +675,47 @@ convertExprAssignment es =
 convertFnApp ::
   W4.ExprSymFn t args ret
   -> Ctx.Assignment (W4.Expr t) args
-  -> Memo t SExp
-convertFnApp fn args
-  | name == "undefined"
-  , BaseBVRepr nr <- W4.fnReturnType fn = do
-      let call = S.L [ ident "_", ident "call", string "uf.undefined" ]
-      return $ S.L [ call, int (NR.intValue nr) ]
-  | otherwise = do
-    let call = S.L [ ident "_", ident "call", string (T.unpack $ fullname) ]
-    ss <- convertExprAssignment args
-    W.tell $ Map.singleton fullname (SomeSome fn)
-    return $ S.L $ call:ss
-  where
-    fullname = prefix <> name
-    name = W4.solverSymbolAsText (W4.symFnName fn)
-    prefix = case W4.symFnInfo fn of
-      W4.UninterpFnInfo _ _ -> "uf."
-      W4.DefinedFnInfo _ _ _ -> "df."
-      _ -> error ("Unsupported function: " ++ T.unpack name)
+  -> Memo t SExpr
+convertFnApp fn args = do
+  argSExprs <- convertExprAssignment args
+  fnEnv <- MS.gets envFreeSymFnEnv
+  case OMap.lookup (SomeSymFn fn) fnEnv of
+    Just fnName ->
+      return $ S.L $ (ident "call"):(ident fnName):argSExprs
+    Nothing -> do
+      varName <- freshFnName fn
+      MS.modify' $ (\e -> e {envFreeSymFnEnv =  fnEnv OMap.|> ((SomeSymFn fn), varName)})
+      return $ S.L $ (ident "call"):(ident varName):argSExprs
 
-convertBaseType :: BaseTypeRepr tp
-              -> SExp
+
+convertBaseType :: BaseTypeRepr tp -> SExpr
 convertBaseType tp = case tp of
-  W4.BaseBoolRepr -> S.A (AIdent "Bool")
-  W4.BaseNatRepr -> S.A (AIdent "Nat")
-  W4.BaseIntegerRepr -> S.A (AIdent "Int")
-  W4.BaseRealRepr -> S.A (AIdent "Real")
-  W4.BaseStringRepr _ -> S.A (AIdent "String") -- parser assumes unicode
-  W4.BaseComplexRepr -> S.A (AIdent "Complex")
-  W4.BaseBVRepr wRepr -> S.L [S.A (AIdent "BV"), S.A (AInt (NR.intValue wRepr)) ]
-  W4.BaseStructRepr tps -> S.L [S.A (AIdent "Struct"), convertBaseTypes tps]
-  W4.BaseArrayRepr ixs repr -> S.L [S.A (AIdent "Array"), convertBaseTypes ixs , convertBaseType repr]
+  W4.BaseBoolRepr -> S.A $ AId "Bool"
+  W4.BaseNatRepr -> S.A $ AId "Nat"
+  W4.BaseIntegerRepr -> S.A $ AId "Int"
+  W4.BaseRealRepr -> S.A $ AId "Real"
+  W4.BaseStringRepr si -> S.L [S.A $ AId "String", convertStringInfo si]
+  W4.BaseComplexRepr -> S.A $ AId "Complex"
+  W4.BaseBVRepr wRepr -> S.L [S.A (AId "BV"), S.A (AInt (NR.intValue wRepr)) ]
+  W4.BaseStructRepr tps -> S.L $ (S.A (AId "Struct")):(convertBaseTypes tps)
+  W4.BaseArrayRepr ixs repr -> S.L [S.A (AId "Array"), S.L $ convertBaseTypes ixs , convertBaseType repr]
   _ -> error "can't print base type"
 
--- | Note `convertBaseTypes` does not "reverse" the list, but syntactically
--- the resulting list appears "reversed" because list-cons and Ctx-cons take
--- their arguments in opposite orders
+
+convertStringInfo :: StringInfoRepr si -> SExpr
+convertStringInfo W4.Char8Repr = ident "Char8"
+convertStringInfo W4.Char16Repr = ident "Char16"
+convertStringInfo W4.UnicodeRepr = ident "Unicode"
+
+-- | Convert an Assignment of base types into a list of base
+-- types SExpr, where the left-to-right syntactic ordering
+-- of the types is maintained.
 convertBaseTypes ::
   Ctx.Assignment BaseTypeRepr tps
-  -> SExp
-convertBaseTypes = S.L . go
-  where go :: Ctx.Assignment BaseTypeRepr tps -> [SExp]
+  -> [SExpr]
+convertBaseTypes = reverse . go
+  where go :: Ctx.Assignment BaseTypeRepr tps -> [SExpr]
         go Ctx.Empty = []
         go (tps Ctx.:> tp) = (convertBaseType tp):(go tps)
+
 

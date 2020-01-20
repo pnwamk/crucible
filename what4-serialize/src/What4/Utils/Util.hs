@@ -30,6 +30,9 @@ import           What4.BaseTypes
 import           What4.Utils.Log
 import qualified What4.Interface as S
 import           What4.Symbol ( SolverSymbol, userSymbol )
+import qualified What4.Expr.Builder as W4
+
+
 import qualified UnliftIO as U
 
 ----------------------------------------------------------------
