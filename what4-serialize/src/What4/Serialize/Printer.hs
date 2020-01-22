@@ -61,7 +61,6 @@ import           What4.Serialize.SETokens ( Atom(..), printSExpr
 
 type SExpr = S.WellFormedSExpr Atom
 
--- | Like 'Data.Parameterized.Some.Some', but for doubly-parameterized types.
 data SomeSymFn t = forall dom ret. SomeSymFn (W4.ExprSymFn t dom ret)
 
 instance Eq (SomeSymFn t) where
@@ -69,7 +68,6 @@ instance Eq (SomeSymFn t) where
     case W4.testEquality (W4.symFnId fn1) (W4.symFnId fn2) of
       Just _ -> True
       _ -> False
-
 
 instance Ord (SomeSymFn t) where
   compare (SomeSymFn fn1) (SomeSymFn fn2) =

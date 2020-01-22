@@ -18,26 +18,26 @@
 
 -- | A parser for an s-expression representation of what4 expressions
 module What4.Serialize.Parser
-  ( readSymFn
-  , readSymFnFromFile
-  , readSymFnEnv
-  , readSymFnEnvFromFile
-  , ParserConfig(..)
-  , defaultParserConfig
-  , SymFnEnv
+  ( deserializeExpr
+  , deserializeExpr'
+  , deserializeSymFn
+  , deserializeSymFn'
+  , deserializeBaseType
   ) where
 
+import qualified Control.Monad.Reader as R
 import qualified Control.Monad.Except as E
-import           Control.Monad.IO.Class ( MonadIO, liftIO )
-import qualified Control.Monad.Reader as MR
+import           Control.Monad.IO.Class ( liftIO )
 import           Data.Kind
 import           Data.Map ( Map )
 import qualified Data.Map as Map
 import qualified Data.SCargot.Repr.WellFormed as S
 
 import           Data.Semigroup
+
+import qualified Data.List as List
+import           Data.Text ( Text )
 import qualified Data.Text as T
-import qualified Data.Text.IO as T
 import           Text.Printf ( printf )
 
 import qualified Data.Parameterized.Ctx as Ctx
@@ -48,17 +48,95 @@ import           Data.Parameterized.Some ( Some(..) )
 import           Data.Parameterized.TraversableFC ( traverseFC, allFC )
 import           What4.BaseTypes
 
+import qualified What4.Expr as W4
+import qualified What4.Expr.Builder as W4
+import qualified What4.Symbol as W4
 import qualified What4.Interface as W4
 
-import           What4.Serialize.SETokens ( Atom(..), printSExpr, parseSExpr)
-import qualified What4.Utils.Log as U
-import           What4.Utils.Util ( SomeSome(..) )
+import           What4.Serialize.SETokens ( Atom(..), printSExpr )
 import qualified What4.Utils.Util as U
 
 import           Prelude
 
 
-type SExp = S.WellFormedSExpr Atom
+type SExpr = S.WellFormedSExpr Atom
+
+data SomeSymFn t = forall dom ret. SomeSymFn (W4.SymFn t dom ret)
+
+type SymFnEnv sym = Map Text (SomeSymFn sym)
+type BaseEnv sym = Map Text (Some (W4.SymExpr sym))
+
+
+
+data Config sym =
+  Config
+  { cSym :: sym
+  -- ^ The symbolic What4 backend being used.
+  , cSymFnEnv :: SymFnEnv sym
+  -- ^ The environment mapping names to defined What4
+  -- SymFns.
+  , cBaseEnv :: BaseEnv sym
+  -- ^ The environment mapping names to defined variables
+  -- with What4 BaseTypes.
+  }
+
+defaultConfig :: sym -> Config sym
+defaultConfig sym = Config {cSym = sym, cSymFnEnv = Map.empty, cBaseEnv = Map.empty}
+
+
+type Processor sym a = E.ExceptT String (R.ReaderT (Config sym) IO) a
+
+runProcessor :: Config sym -> Processor sym a -> IO a
+runProcessor cfg action = do
+  res <- R.runReaderT (E.runExceptT action) cfg
+  case res of
+    Left errMsg -> error errMsg
+    Right a -> return a
+
+-- | @(deserializeExpr sym)@ is equivalent
+-- to @(deserializeExpr' (defaultConfig sym))@.
+deserializeExpr ::
+  forall sym . (W4.IsSymExprBuilder sym, ShowF (W4.SymExpr sym))
+  => sym
+  -> SExpr
+  -> IO (Some (W4.SymExpr sym))
+deserializeExpr sym = deserializeExpr' cfg
+  where cfg = defaultConfig sym
+
+deserializeExpr' ::
+  forall sym . (W4.IsSymExprBuilder sym, ShowF (W4.SymExpr sym))
+  => Config sym
+  -> SExpr
+  -> IO (Some (W4.SymExpr sym))
+deserializeExpr' cfg sexpr = runProcessor cfg (readExpr sexpr)
+
+-- | @(deserializeSymFn sym)@ is equivalent
+-- to @(deserializeSymFn' (defaultConfig sym))@.
+deserializeSymFn ::
+  forall sym . (W4.IsSymExprBuilder sym, ShowF (W4.SymExpr sym))
+  => sym
+  -> SExpr
+  -> IO (SomeSymFn sym)
+deserializeSymFn sym = deserializeSymFn' cfg
+  where cfg = defaultConfig sym
+
+deserializeSymFn' ::
+  forall sym . (W4.IsSymExprBuilder sym, ShowF (W4.SymExpr sym))
+  => Config sym
+  -> SExpr
+  -> IO (SomeSymFn sym)
+deserializeSymFn' cfg sexpr = runProcessor cfg (readSymFn sexpr)
+
+deserializeBaseType ::
+  forall sym . (W4.IsSymExprBuilder sym, ShowF (W4.SymExpr sym))
+  => sym
+  -> SExpr
+  -> IO (Some BaseTypeRepr)
+deserializeBaseType sym sexpr = runProcessor (defaultConfig sym) (readBaseType sexpr)
+
+
+
+
 
 -- * First pass of parsing turns the raw text into s-expressions.
 --   This pass is handled by the code in What4.Serialize.SETokens
@@ -78,24 +156,14 @@ fromMaybeError :: (E.MonadError e m) => e -> Maybe a -> m a
 fromMaybeError err = maybe (E.throwError err) return
 
 
-data ParsedVariable sym (tps :: Ctx.Ctx BaseType) (tp :: BaseType) where
-  ParsedArgument :: BaseTypeRepr tp -> Ctx.Index tps tp
-                 -> ParsedVariable sym tps tp
-  ParsedGlobal :: W4.SymExpr sym tp -> ParsedVariable sym tps tp
-
--- | Data about the argument pertinent after parsing: their name and their type.
-data ArgData (tp :: BaseType) where
-  ArgData :: String -> BaseTypeRepr tp -> ArgData tp
-
-
-readBaseType :: forall m
-              . (E.MonadError String m)
-             => SExp
-             -> m (Some BaseTypeRepr)
+readBaseType ::
+  forall sym . (W4.IsSymExprBuilder sym, ShowF (W4.SymExpr sym))
+  => SExpr
+  -> Processor sym (Some BaseTypeRepr)
 readBaseType sexpr =
   case sexpr of
-    S.WFSAtom (AIdent atom) ->
-      case atom of
+    S.WFSAtom (AId atom) ->
+      case (T.unpack atom) of
         "Bool" -> return $ Some BaseBoolRepr
         "Nat" -> return $ Some BaseNatRepr
         "Int" -> return $ Some BaseIntegerRepr
@@ -103,16 +171,16 @@ readBaseType sexpr =
         "String" -> return $ Some (BaseStringRepr UnicodeRepr)
         "Complex" -> return $ Some BaseComplexRepr
         _ -> panic
-    S.WFSList [(S.WFSAtom (AIdent "BV")), (S.WFSAtom (AInt w))]
+    S.WFSList [(S.WFSAtom (AId "BV")), (S.WFSAtom (AInt w))]
       | Just (Some wRepr) <- someNat w
       , Just LeqProof <- testLeq (knownNat @1) wRepr
         -> return $ Some (BaseBVRepr wRepr)
       | otherwise
         -> panic
-    S.WFSList [(S.WFSAtom (AIdent "Struct")), args] -> do
+    S.WFSList [(S.WFSAtom (AId "Struct")), args] -> do
       Some tps <- readBaseTypes args
       return $ Some (BaseStructRepr tps)
-    S.WFSList [S.WFSAtom (AIdent "Array"), ixArgs, tpArg] -> do
+    S.WFSList [S.WFSAtom (AId "Array"), ixArgs, tpArg] -> do
       Some ixs <- readBaseTypes ixArgs
       Some tp <- readBaseType tpArg
       case Ctx.viewAssign ixs of
@@ -122,15 +190,15 @@ readBaseType sexpr =
   where
     panic = E.throwError $ "unknown base type: " ++ show sexpr
 
-readBaseTypes :: forall m
-              . (E.MonadError String m)
-              => SExp
-              -> m (Some (Ctx.Assignment BaseTypeRepr))
+readBaseTypes ::
+  forall sym . (W4.IsSymExprBuilder sym, ShowF (W4.SymExpr sym))
+  => SExpr
+  -> Processor sym (Some (Ctx.Assignment BaseTypeRepr))
 readBaseTypes sexpr@(S.WFSAtom _) = E.throwError $ "expected list of base types: " ++ show sexpr
 readBaseTypes (S.WFSList sexprs) =
   go sexprs
   where
-    go :: [SExp] -> m (Some (Ctx.Assignment BaseTypeRepr))
+    go :: [SExpr] -> Processor sym (Some (Ctx.Assignment BaseTypeRepr))
     go sexpr =
       case sexpr of
         [] -> return (Some Ctx.empty)
@@ -139,59 +207,7 @@ readBaseTypes (S.WFSList sexprs) =
           Some tps <- go rest
           return $ Some $ Ctx.extend tps tp
 
--- | Short-lived type that just stores an index with its corresponding type
--- representation, with the type parameter ensuring they correspond to one another.
-data IndexWithType (sh :: Ctx.Ctx BaseType) (tp :: BaseType) where
-  IndexWithType :: BaseTypeRepr tp -> Ctx.Index sh tp -> IndexWithType sh tp
-
--- | Look up a name in the given operand list, returning its index and type if found.
-findArgListIndex :: forall sh. String -> Ctx.Assignment ArgData sh -> Maybe (Some (IndexWithType sh))
-findArgListIndex x args = Ctx.forIndex (Ctx.size args) getArg Nothing
-  where
-    getArg :: forall tp
-            . Maybe (Some (IndexWithType sh))
-           -> Ctx.Index sh tp
-           -> Maybe (Some (IndexWithType sh))
-    getArg Nothing idx = case args Ctx.! idx of
-      ArgData name tpRepr
-        | name == x -> Just $ Some (IndexWithType tpRepr idx)
-      _ -> Nothing
-    getArg (Just iwt) _ = Just iwt
-
-
--- | Parse a single parameter, given the list of operands to use as a lookup.
-readVariable :: forall sym tps m. (E.MonadError String m) => (String -> (Maybe (Some (W4.SymExpr sym)))) -> Ctx.Assignment ArgData tps -> String -> m (Some (ParsedVariable sym tps))
-readVariable lookupGlobal arglist name = do
-  case lookupGlobal name of
-    Just (Some glb) -> return $ Some (ParsedGlobal glb)
-    Nothing
-      | Just (Some (IndexWithType tpRepr idx)) <- findArgListIndex name arglist ->
-        return $ Some (ParsedArgument tpRepr idx)
-    _ -> E.throwError $ printf "couldn't find binding for variable %s" name
-
 -- ** Parsing definitions
-
--- | "Global" data stored in the Reader monad throughout parsing the definitions.
-data DefsInfo sym tps =
-  DefsInfo
-  { getSym :: sym
-    -- ^ SymInterface/ExprBuilder used to build up symbolic
-    -- expressions while parsing the definitions.
-    , getFnEnv :: SymFnEnv sym
-    -- ^ Global SymFn environment.
-    , getBaseEnv :: (BaseEnv sym)
-    -- ^ Function to retrieve the expression corresponding to the
-    -- given global variable (which is not a SymFn).
-    , getArgVarList :: Ctx.Assignment (W4.BoundVar sym) tps
-    -- ^ ShapedList used to retrieve the variable
-    -- corresponding to a given argument.
-    , getArgNameList :: Ctx.Assignment ArgData tps
-    -- ^ ShapedList used to look up the index given an
-    -- argument's name.
-    , getLetBindings :: BaseEnv sym
-    -- ^ Mapping of currently in-scope let-bound variables
-    --- to their parsed bindings.
-    }
 
 -- | Stores a NatRepr along with proof that its type parameter is a bitvector of
 -- that length. Used for easy pattern matching on the LHS of a binding in a
@@ -268,7 +284,7 @@ data Op sym where
                 -> Op sym
 
 -- | Lookup mapping operators to their Op definitions (if they exist)
-lookupOp :: forall sym . W4.IsSymExprBuilder sym => String -> Maybe (Op sym)
+lookupOp :: forall sym . W4.IsSymExprBuilder sym => Text -> Maybe (Op sym)
 lookupOp = \case
   -- -- -- Boolean ops -- -- --
   "andp" -> Just $ Op2 knownRepr $ W4.andPred
@@ -385,16 +401,13 @@ lookupOp = \case
     U.withRounding sym r $ \rm -> W4.floatFMA @_ @Prec32 sym rm x y z
   _ -> Nothing
 
+
 -- | Verify a list of arguments has a single argument and
 -- return it, else raise an error.
 readOneArg ::
-  (W4.IsSymExprBuilder sym,
-    E.MonadError String m,
-    MR.MonadReader (DefsInfo sym sh) m,
-    ShowF (W4.SymExpr sym),
-    MonadIO m)
-  => [SExp]
-  -> m (Some (W4.SymExpr sym))
+  forall sym . (W4.IsSymExprBuilder sym, ShowF (W4.SymExpr sym))
+  => [SExpr]
+  -> Processor sym (Some (W4.SymExpr sym))
 readOneArg operands = do
   args <- readExprs operands
   case args of
@@ -404,13 +417,9 @@ readOneArg operands = do
 -- | Verify a list of arguments has two arguments and return
 -- it, else raise an error.
 readTwoArgs ::
-  (W4.IsSymExprBuilder sym,
-    E.MonadError String m,
-    MR.MonadReader (DefsInfo sym sh) m,
-    ShowF (W4.SymExpr sym),
-    MonadIO m)
-  => [SExp]
-  -> m (Some (W4.SymExpr sym), Some (W4.SymExpr sym))
+  forall sym . (W4.IsSymExprBuilder sym, ShowF (W4.SymExpr sym))
+  => [SExpr]
+  -> Processor sym (Some (W4.SymExpr sym), Some (W4.SymExpr sym))
 readTwoArgs operands = do
   args <- readExprs operands
   case args of
@@ -420,13 +429,9 @@ readTwoArgs operands = do
 -- | Verify a list of arguments has three arguments and
 -- return it, else raise an error.
 readThreeArgs ::
-  (W4.IsSymExprBuilder sym,
-    E.MonadError String m,
-    MR.MonadReader (DefsInfo sym sh) m,
-    ShowF (W4.SymExpr sym),
-    MonadIO m)
-  => [SExp]
-  -> m (Some (W4.SymExpr sym), Some (W4.SymExpr sym), Some (W4.SymExpr sym))
+  forall sym . (W4.IsSymExprBuilder sym, ShowF (W4.SymExpr sym))
+  => [SExpr]
+  -> Processor sym (Some (W4.SymExpr sym), Some (W4.SymExpr sym), Some (W4.SymExpr sym))
 readThreeArgs operands = do
   args <- readExprs operands
   case args of
@@ -437,17 +442,12 @@ readThreeArgs operands = do
 
 -- | Reads an "application" form, i.e. @(operator operands ...)@.
 readApp ::
-  forall sym m sh.
-  (W4.IsSymExprBuilder sym,
-    E.MonadError String m,
-    MR.MonadReader (DefsInfo sym sh) m,
-    ShowF (W4.SymExpr sym),
-    MonadIO m)
-  => SExp
-  -> [SExp]
-  -> m (Some (W4.SymExpr sym))
-readApp opRaw@(S.WFSAtom (AIdent operator)) operands = do
-  sym <- MR.reader getSym
+  forall sym . (W4.IsSymExprBuilder sym, ShowF (W4.SymExpr sym))
+  => SExpr
+  -> [SExpr]
+  -> Processor sym (Some (W4.SymExpr sym))
+readApp opRaw@(S.WFSAtom (AId operator)) operands = do
+  sym <- R.reader cSym
   prefixError ("in reading expression:\n"
                ++(T.unpack $ printSExpr mempty $ S.WFSList (opRaw:operands))++"\n") $
   -- Parse an expression of the form @(fnname operands ...)@
@@ -599,9 +599,9 @@ readApp opRaw@(S.WFSAtom (AIdent operator)) operands = do
               _ -> E.throwError $ unwords ["integerToBV expects two operands, the first of which is a nat, got", show operands]
           _ -> E.throwError $ printf "couldn't parse application of %s" (printSExpr mempty opRaw)
 -- Parse an expression of the form @((_ extract i j) x)@.
-readApp (S.WFSList [S.WFSAtom (AIdent "_"), S.WFSAtom (AIdent "extract"), S.WFSAtom (AInt iInt), S.WFSAtom (AInt jInt)])
+readApp (S.WFSList [S.WFSAtom (AId "_"), S.WFSAtom (AId "extract"), S.WFSAtom (AInt iInt), S.WFSAtom (AInt jInt)])
   args = prefixError "in reading extract expression: " $ do
-  sym <- MR.reader getSym
+  sym <- R.reader cSym
   (Some arg) <- readOneArg args
   -- The SMT-LIB spec represents extracts differently than Crucible does. Per
   -- SMT: "extraction of bits i down to j from a bitvector of size m to yield a
@@ -634,11 +634,11 @@ readApp (S.WFSList [S.WFSAtom (AIdent "_"), S.WFSAtom (AIdent "extract"), S.WFSA
     testLeq (addNat idxNat nNat) lenNat
   liftIO (Some <$> W4.bvSelect sym idxNat nNat arg)
 -- Parse an expression of the form @((_ zero_extend i) x)@ or @((_ sign_extend i) x)@.
-readApp (S.WFSList [S.WFSAtom (AIdent "_"), S.WFSAtom (AIdent extend), S.WFSAtom (AInt iInt)])
+readApp (S.WFSList [S.WFSAtom (AId "_"), S.WFSAtom (AId extend), S.WFSAtom (AInt iInt)])
   args
   | extend == "zero_extend" ||
     extend == "sign_extend" = prefixError (printf "in reading %s expression: " extend) $ do
-      sym <- MR.reader getSym
+      sym <- R.reader cSym
       Some arg <- readOneArg args
       Some iNat <- intToNatM iInt
       iPositive <- fromMaybeError "must extend by a positive length" $ isPosNat iNat
@@ -647,51 +647,6 @@ readApp (S.WFSList [S.WFSAtom (AIdent "_"), S.WFSAtom (AIdent extend), S.WFSAtom
       liftIO $ withLeqProof (leqAdd2 (leqRefl lenNat) iPositive) $
         let op = if extend == "zero_extend" then W4.bvZext else W4.bvSext
         in Some <$> op sym newLen arg
--- | Parse an expression of the form:
---
--- > ((_ call "undefined") "bv" size)
---
--- This has to be separate from the normal uninterpreted functions because the
--- type is determined by the arguments.
-readApp (S.WFSList [S.WFSAtom (AIdent "_"), S.WFSAtom (AIdent "call"), S.WFSAtom (AString "uf.undefined")])
-  operands = do
-  (Some ex) <- readOneArg operands
-  case W4.exprType ex of
-    BaseBVRepr {}
-      | Just size <- W4.asUnsignedBV ex -> do
-          sym <- MR.reader getSym
-          case NR.someNat ((fromIntegral size) :: Integer) of
-            Just (Some nr) -> mkUndefined nr sym
-            Nothing -> E.throwError $ printf "Invalid size for undefined value: %d" size
-    ety -> E.throwError $ printf "Invalid expr type: %s" (show ety)
-  where
-    mkUndefined :: NR.NatRepr n -> sym -> m (Some (W4.SymExpr sym))
-    mkUndefined nr sym = do
-      case NR.testLeq (knownNat @1) nr of
-        Just NR.LeqProof -> do
-          let rty = BaseBVRepr nr
-          fn <- liftIO (W4.freshTotalUninterpFn sym (U.makeSymbol "uf.undefined") Ctx.empty rty)
-          assn <- exprAssignment (W4.fnArgTypes fn) []
-          Some <$> liftIO (W4.applySymFn sym fn assn)
-        Nothing -> E.throwError $ printf "Invalid size for undefined value: %d" (NR.widthVal nr)
--- Parse an expression of the form @((_ call "foo") x y ...)@
-readApp (S.WFSList [S.WFSAtom (AIdent "_"), S.WFSAtom (AIdent "call"), S.WFSAtom (AString fnName)])
-  operands =
-  prefixError ("in reading call '" <> fnName <> "' expression: ") $ do
-    sym <- MR.reader getSym
-    fns <- MR.reader getFnEnv
-    SomeSome fn <- case Map.lookup fnName fns of
-      Just fn -> return fn
-      Nothing ->
-        let template = case take 3 fnName of
-              "uf." -> "uninterpreted function '%s' is not defined"
-              "df." -> "library function '%s' is not defined"
-              _     -> "unrecognized function prefix: '%s'"
-        in E.throwError $ printf template fnName
-    args <- readExprs operands
-    assn <- exprAssignment (W4.fnArgTypes fn) (reverse args)
-    liftIO (Some <$> W4.applySymFn sym fn assn)
-readApp opRaw _ = E.throwError $ printf "couldn't parse application of %s" (printSExpr mempty opRaw)
 
 
 
@@ -721,13 +676,13 @@ expectArrayWithIndex dimRepr (BaseArrayRepr idxTpReprs resRepr) =
 expectArrayWithIndex _ repr = E.throwError $ unwords ["expected an array, got", show repr]
 
 
-exprAssignment' :: (E.MonadError String m,
-                    W4.IsExpr ex)
-                => Ctx.Assignment BaseTypeRepr ctx
-                -> [Some ex]
-                -> Int
-                -> Int
-                -> m (Ctx.Assignment ex ctx)
+exprAssignment' ::
+  forall sym ctx ex . (W4.IsSymExprBuilder sym, ShowF (W4.SymExpr sym), W4.IsExpr ex)
+  => Ctx.Assignment BaseTypeRepr ctx
+  -> [Some ex]
+  -> Int
+  -> Int
+  -> Processor sym (Ctx.Assignment ex ctx)
 exprAssignment' (Ctx.viewAssign -> Ctx.AssignEmpty) [] _ _ = return Ctx.empty
 exprAssignment' (Ctx.viewAssign -> Ctx.AssignExtend restTps tp) (Some e : restExprs) idx len = do
   Refl <- case testEquality tp (W4.exprType e) of
@@ -738,11 +693,11 @@ exprAssignment' (Ctx.viewAssign -> Ctx.AssignExtend restTps tp) (Some e : restEx
   return $ restAssn Ctx.:> e
 exprAssignment' _ _ _  _ = E.throwError "mismatching numbers of arguments"
 
-exprAssignment :: (E.MonadError String m,
-                   W4.IsExpr ex)
-               => Ctx.Assignment BaseTypeRepr ctx
-               -> [Some ex]
-               -> m (Ctx.Assignment ex ctx)
+exprAssignment ::
+  forall sym ctx ex . (W4.IsSymExprBuilder sym, ShowF (W4.SymExpr sym), W4.IsExpr ex)
+  => Ctx.Assignment BaseTypeRepr ctx
+  -> [Some ex]
+  -> Processor sym (Ctx.Assignment ex ctx)
 exprAssignment tpAssn exs = exprAssignment' tpAssn (reverse exs) 0 (Ctx.sizeInt $ Ctx.size tpAssn)
 
 
@@ -751,50 +706,56 @@ exprAssignment tpAssn exs = exprAssignment' tpAssn (reverse exs) 0 (Ctx.sizeInt 
 -- let, parse the bindings into the Reader monad's state and
 -- then parse the body with those newly bound variables.
 readLetExpr ::
-  forall sym m sh
-  . (W4.IsSymExprBuilder sym,
-      Monad m,
-      E.MonadError String m,
-      MR.MonadReader (DefsInfo sym sh) m,
-      ShowF (W4.SymExpr sym),
-      MonadIO m)
-  => [SExp]
+  forall sym . (W4.IsSymExprBuilder sym, ShowF (W4.SymExpr sym))
+  => [SExpr]
   -- ^ Bindings in a let-expression.
-  -> SExp
+  -> SExpr
   -- ^ Body of the let-expression.
-  -> m (Some (W4.SymExpr sym))
+  -> Processor sym (Some (W4.SymExpr sym))
 readLetExpr [] body = readExpr body
-readLetExpr ((S.WFSList [S.WFSAtom (AIdent x), e]):rst) body = do
+readLetExpr ((S.WFSList [S.WFSAtom (AId x), e]):rst) body = do
   v <- readExpr e
-  MR.local (\r -> r {getLetBindings = (Map.insert x v) $ getLetBindings r}) $
+  R.local (\c -> c {cBaseEnv = (Map.insert x v) $ cBaseEnv c}) $
     readLetExpr rst body
 readLetExpr bindings _body = E.throwError $
   "invalid s-expression for let-bindings: " ++ (show bindings)
 
+
+readLetFnExpr ::
+  forall sym . (W4.IsSymExprBuilder sym, ShowF (W4.SymExpr sym))
+  => [SExpr]
+  -- ^ Bindings in a let-expression.
+  -> SExpr
+  -- ^ Body of the let-expression.
+  -> Processor sym (Some (W4.SymExpr sym))
+readLetFnExpr [] body = readExpr body
+readLetFnExpr ((S.WFSList [S.WFSAtom (AId f), e]):rst) body = do
+  v <- readExpr e
+  R.local (\c -> c {cBaseEnv = (Map.insert f v) $ cBaseEnv c}) $
+    readLetExpr rst body
+readLetFnExpr bindings _body = E.throwError $
+  "invalid s-expression for let-bindings: " ++ (show bindings)
+
+  
 -- | Parse an arbitrary expression.
-readExpr :: forall sym m sh
-          . (W4.IsSymExprBuilder sym,
-             Monad m,
-             E.MonadError String m,
-             MR.MonadReader (DefsInfo sym sh) m,
-             ShowF (W4.SymExpr sym),
-             MonadIO m)
-         => SExp
-         -> m (Some (W4.SymExpr sym))
+readExpr ::
+  forall sym . (W4.IsSymExprBuilder sym, ShowF (W4.SymExpr sym))
+  => SExpr
+  -> Processor sym (Some (W4.SymExpr sym))
 readExpr (S.WFSAtom (AInt n)) = do
-  sym <- MR.reader getSym
+  sym <- R.reader cSym
   liftIO $ (Some <$> W4.intLit sym n)
 readExpr (S.WFSAtom (ANat n)) = do
-  sym <- MR.reader getSym
+  sym <- R.reader cSym
   liftIO $ (Some <$> W4.natLit sym n)
 readExpr (S.WFSAtom (ABool b)) = do
-  sym <- MR.reader getSym
+  sym <- R.reader cSym
   liftIO $ return $ Some $ W4.backendPred sym b
-readExpr (S.WFSAtom (AString _)) = error $ "TODO: support readExpr for string literals"
+readExpr (S.WFSAtom (AStr _)) = error $ "TODO: support readExpr for string literals"
 readExpr (S.WFSAtom (AReal _)) = error $ "TODO: support readExpr for real literals"
 readExpr (S.WFSAtom (ABV len val)) = do
   -- This is a bitvector literal.
-  sym <- MR.reader getSym
+  sym <- R.reader cSym
   -- The following two patterns should never fail, given that during parsing we
   -- can only construct BVs with positive length.
   case someNat (toInteger len) of
@@ -806,43 +767,34 @@ readExpr (S.WFSAtom (ABV len val)) = do
   -- let Just pf = isPosNat lenRepr
   -- liftIO $ withLeqProof pf (Some <$> W4.bvLit sym lenRepr val)
 -- Let-bound variable
-readExpr (S.WFSAtom (AIdent name)) = do
-  maybeBinding <- MR.asks $ (Map.lookup name) . getLetBindings
+readExpr (S.WFSAtom (AId name)) = do
+  maybeBinding <- R.asks $ (Map.lookup name) . cBaseEnv
   -- We first check the local lexical environment (i.e., the
   -- in-scope let-bindings) before consulting the "global"
   -- scope.
   case maybeBinding of
-    -- simply return it's let-binding
+    -- simply return it's bound value
     Just binding -> return binding
-    Nothing -> do
-      DefsInfo { getArgNameList = argNames
-               , getSym = sym
-               , getArgVarList = argVars
-               , getBaseEnv = baseEnv
-               } <- MR.ask
-      var <- readVariable @sym (\nm -> Map.lookup nm baseEnv) argNames name
-      case var of
-        Some (ParsedArgument _ idx) ->
-          return . Some . W4.varExpr sym $ (argVars Ctx.! idx)
-        Some (ParsedGlobal expr) -> return $ Some expr
-readExpr (S.WFSList ((S.WFSAtom (AIdent "let")):rhs)) =
+    Nothing -> E.throwError $ ("Unbound variable encountered during deserialization: "
+                               ++ (T.unpack name))
+readExpr (S.WFSList ((S.WFSAtom (AId "let")):rhs)) =
   case rhs of
     [S.WFSList bindings, body] -> readLetExpr bindings body
     _ -> E.throwError "ill-formed let s-expression"
+readExpr (S.WFSList ((S.WFSAtom (AId "letfn")):rhs)) =
+  case rhs of
+    [S.WFSList bindings, body] -> readLetFnExpr bindings body
+    _ -> E.throwError "ill-formed letfn s-expression"
 readExpr (S.WFSList []) = E.throwError "ill-formed empty s-expression"
 readExpr (S.WFSList (operator:operands)) = readApp operator operands
 
 
 
 -- | Parse multiple expressions in a list.
-readExprs :: (W4.IsSymExprBuilder sym,
-              Monad m,
-              E.MonadError String m,
-              MR.MonadReader (DefsInfo sym sh) m,
-              ShowF (W4.SymExpr sym),
-              MonadIO m)
-          => [SExp]
-          -> m [Some (W4.SymExpr sym)]
+readExprs ::
+  forall sym . (W4.IsSymExprBuilder sym, ShowF (W4.SymExpr sym))
+  => [SExpr]
+  -> Processor sym [Some (W4.SymExpr sym)]
 readExprs [] = return []
 readExprs (e:rest) = do
   e' <- readExpr e
@@ -850,15 +802,9 @@ readExprs (e:rest) = do
   return $ e' : rest'
 
 readExprsAsAssignment ::
-  forall sym m sh .
-  (W4.IsSymExprBuilder sym,
-    Monad m,
-    E.MonadError String m,
-    MR.MonadReader (DefsInfo sym sh) m,
-    ShowF (W4.SymExpr sym),
-    MonadIO m)
-  => [SExp]
-  -> m (Some (Ctx.Assignment (W4.SymExpr sym)))
+  forall sym . (W4.IsSymExprBuilder sym, ShowF (W4.SymExpr sym))
+  => [SExpr]
+  -> Processor sym (Some (Ctx.Assignment (W4.SymExpr sym)))
 readExprsAsAssignment [] = return $ Some Ctx.empty
 readExprsAsAssignment (s:rest) = do
   Some e <- readExpr s
@@ -866,220 +812,123 @@ readExprsAsAssignment (s:rest) = do
   return $ Some (Ctx.extend ss e)
 
 
-buildArgumentList :: forall m
-                    . (E.MonadError String m)
-                   => [SExp]
-                   -> m (Some (Ctx.Assignment ArgData))
-buildArgumentList sexpr =
-  case sexpr of
-    [] -> return $ Some (Ctx.empty)
-    (s:rest) -> do
-      (operand, tyRaw) <- case s of
-        S.WFSList [(S.WFSAtom (AIdent arg)), ty]
-          -> return (arg, ty)
-        _ -> E.throwError $ "Expected (operand . 'type) pair: " ++ show s
-      Some tp <- readBaseType tyRaw
-      Some rest' <- buildArgumentList rest
-      return $ Some (rest' Ctx.:> (ArgData operand tp))
+readFnType ::
+  forall sym . (W4.IsSymExprBuilder sym, ShowF (W4.SymExpr sym))
+  => SExpr
+  -> Processor sym ([Some BaseTypeRepr], Some BaseTypeRepr)
+readFnType (S.WFSList ((S.WFSAtom (AId "->")):typeSExprs))
+  | length typeSExprs < 1 =
+      E.throwError $ ("invalid type signature for function: "
+                      ++ (T.unpack $ printSExpr mempty (S.L typeSExprs)))
+  | otherwise = do
+      let (domSExps, [retSExp]) = List.splitAt ((length typeSExprs) - 1) typeSExprs
+      dom <- mapM readBaseType domSExps
+      ret <- readBaseType retSExp
+      return (dom, ret)
+readFnType sexpr =
+  E.throwError $ ("invalid type signature for function: "
+                  ++ (T.unpack $ printSExpr mempty sexpr))
 
-readSymFn' :: forall sym m
-           . (W4.IsExprBuilder sym,
-              W4.IsSymExprBuilder sym,
-              E.MonadError String m,
-              MonadIO m,
-              ShowF (W4.SymExpr sym),
-              U.HasLogCfg)
-          => ParserConfig sym
-          -> SExp
-          -> m (SomeSome (W4.SymFn sym))
-readSymFn' cfg sexpr =
-  let
-    sym = pSym cfg
-    fnEnv = pSymFnEnv cfg
-    baseEnv = pBaseEnv cfg
-  in do
-  (name, symFnInfoRaw) <- case sexpr of
-    S.WFSList [S.WFSAtom (AIdent "symfn"), S.WFSAtom (AString nm), info] -> return (nm, info)
-    _ -> E.throwError ("invalid top-level function definition structure:\n" ++ show sexpr)
+readFnArgs ::
+  forall sym . (W4.IsSymExprBuilder sym, ShowF (W4.SymExpr sym))
+  => [SExpr]
+  -> Processor sym [Text]
+readFnArgs [] = return []
+readFnArgs ((S.WFSAtom (AId name)):rest) = do
+  names <- (readFnArgs rest)
+  return $ name:names
+readFnArgs (badArg:_) =
+  E.throwError $ ("invalid function argument encountered: "
+                  ++ (T.unpack $ printSExpr mempty badArg))
 
-  let symbol = U.makeSymbol name
-  case symFnInfoRaw of
-    S.WFSList [S.WFSAtom (AIdent "definedfn"), argTsRaw, retTRaw, S.WFSList argVarsRaw, exprRaw]
-      -> do
-        Some argTs <- readBaseTypes argTsRaw
-        Some retT <- readBaseType retTRaw
-        let ufname = "uf." ++ name
-        -- For recursive calls, we may need an uninterpreted variant of this function
-        fnEnv' <- case Map.lookup ufname fnEnv of
-          Just (U.SomeSome ufsymFn) ->
-            if | Just Refl <- testEquality argTs (W4.fnArgTypes ufsymFn)
-               , Just Refl <- testEquality retT (W4.fnReturnType ufsymFn) -> return fnEnv
-               | otherwise -> E.throwError $ "Bad signature for existing function: " ++ show name
-          Nothing -> do
-            symFn <- liftIO $ W4.freshTotalUninterpFn sym symbol argTs retT
-            return $ Map.insert ufname (U.SomeSome symFn) fnEnv
+mkBoundVarAssignment :: 
+  forall sym . (W4.IsSymExprBuilder sym, ShowF (W4.SymExpr sym))
+  => sym
+  -> [Some (W4.BoundVar sym)]
+  -> (Some (Ctx.Assignment (W4.BoundVar sym)))
+  -- TODO should we reverse this? It makes it syntactically look
+  -- like the What4 source... CHECK PRINTER!
+mkBoundVarAssignment _sym vars = go $ reverse vars
+  where go [] = Some Ctx.empty
+        go ((Some x):xs) =
+          case go xs of
+            (Some ys) -> Some (Ctx.extend ys x)
 
-        Some argNameList <- buildArgumentList @m argVarsRaw
-        argVarList <- traverseFC mkArgumentVar argNameList
-        Some expr <- MR.runReaderT (readExpr exprRaw) $
-          DefsInfo { getSym = sym
-                   , getFnEnv = fnEnv'
-                   , getBaseEnv = baseEnv
-                   , getArgVarList = argVarList
-                   , getArgNameList = argNameList
-                   , getLetBindings = Map.empty
-                   }
-        let expand args = allFC W4.baseIsConcrete args
-        symFn <- liftIO $ W4.definedFn sym symbol argVarList expr expand
-        return $ SomeSome symFn
-    S.WFSList [S.WFSAtom (AIdent "uninterpfn"), argTsRaw, retTRaw]
-      -> do
-        Some argTs <- readBaseTypes argTsRaw
-        Some retT <- readBaseType retTRaw
-        case Map.lookup ("uf."++name) fnEnv of
-          Just (SomeSome symFn) -> do
-            let argTs' = W4.fnArgTypes symFn
-            let retT' = W4.fnReturnType symFn
-            if | Just Refl <- testEquality argTs argTs'
-               , Just Refl <- testEquality retT retT' -> do
-                 return $ SomeSome symFn
-               | otherwise -> E.throwError "invalid function signature in environment"
-          _ -> do
-            symFn <- liftIO $ W4.freshTotalUninterpFn sym symbol argTs retT
-            return $ SomeSome symFn
-    _ -> E.throwError "invalid function definition info structure"
-        
-  where    
-    mkArgumentVar :: forall tp. ArgData tp -> m (W4.BoundVar sym tp)
-    mkArgumentVar (ArgData varName tpRepr) =
-      let symbol = U.makeSymbol varName
-      in liftIO $ W4.freshBoundVar (pSym cfg) symbol tpRepr
-
-genRead :: forall a
-         . U.HasLogCfg
-        => String
-        -> (SExp -> E.ExceptT String IO a)
-        -> T.Text
-        -> IO (Either String a)
-genRead callnm m text = E.runExceptT $ go
-  where
-    go = do
-      sexpr <- case parseSExpr text of
-                 Left err -> E.throwError err
-                 Right res -> return res
-      let firstLine = show $ fmap T.unpack $ take 1 $ T.lines text
-      liftIO $ U.logIO U.Info $
-        callnm ++ " of " ++ (show $ T.length text) ++ " bytes " ++ firstLine
-      m sexpr
+mkBaseTypeAssignment ::
+  [Some (W4.BaseTypeRepr)]
+  -> (Some (Ctx.Assignment W4.BaseTypeRepr))
+  -- TODO should we reverse this? It makes it syntactically look
+  -- like the What4 source... CHECK PRINTER!
+mkBaseTypeAssignment tys = go $ reverse tys
+  where go [] = Some Ctx.empty
+        go ((Some t):ts) =
+          case go ts of
+            (Some ts') -> Some (Ctx.extend ts' t)
 
 
--- BOOKMARK / TODO / FIXME Do we want a
---  pGlobalEnv :: Map T.Text -> Either (Some (W4.SymExpr t)) (SomeSome (W4.SymFn t))
--- OR just
--- pGlobalEnv :: Map T.Text -> (Some (W4.SymExpr t))
--- (i.e., can / should SymFns be stuffed into regular SymExprs? we're doing that with everything
--- else... but perhaps functions are special because they're not first class values
--- in What4? I.e., there's no BaseType for a function type (right?))
-data ParserConfig sym = ParserConfig
-  { pSym :: sym
-  -- ^ The symbolic What4 backend being used.
-  , pSymFnEnv :: SymFnEnv sym
-  -- ^ The environment of defined What4 SymFns.
-  , pBaseEnv :: BaseEnv sym
-  -- ^ The environment of defined variables with What4 BaseTypes.
-  }
-  -- N.B. these were removed:
-  -- , pGlobalLookup :: T.Text -> IO (Maybe (Some (W4.SymExpr t)))
-  -- , pOverrides :: String -> Maybe ([Some (W4.SymExpr t)] -> IO (Either String (Some (W4.SymExpr t))))
+someVarExpr ::
+    forall sym . (W4.IsSymExprBuilder sym, ShowF (W4.SymExpr sym))
+  => sym
+  -> Some (W4.BoundVar sym)
+  -> Some (W4.SymExpr sym)
+someVarExpr sym (Some bv) = Some (W4.varExpr sym bv)
 
-type SymFnEnv sym = Map String (SomeSome (W4.SymFn sym))
-type BaseEnv sym = Map String (Some (W4.SymExpr sym))
-
-defaultParserConfig :: t -> ParserConfig t
-defaultParserConfig t =
-  ParserConfig { pSym = t
-               , pSymFnEnv = Map.empty
-               , pBaseEnv = Map.empty
-               }
-
-readSymFn :: forall sym
-           . (W4.IsExprBuilder sym,
-              W4.IsSymExprBuilder sym,
-              ShowF (W4.SymExpr sym),
-              U.HasLogCfg)
-          => ParserConfig sym
-          -> T.Text
-          -> IO (Either String (SomeSome (W4.SymFn sym)))
-readSymFn cfg = genRead "readSymFn" (readSymFn' cfg)
-
-readSymFnFromFile :: forall sym
-                   . (W4.IsExprBuilder sym,
-                      W4.IsSymExprBuilder sym,
-                      ShowF (W4.SymExpr sym),
-                      U.HasLogCfg)
-                  => ParserConfig sym
-                  -> FilePath
-                  -> IO (Either String (SomeSome (W4.SymFn sym)))
-readSymFnFromFile cfg fp = do
-  liftIO $ U.logIO U.Info $ "readSymFnFromFile " ++ fp
-  readSymFn cfg =<< T.readFile fp
-
-readSymFnEnv' :: forall sym m
-               . (W4.IsExprBuilder sym,
-                  W4.IsSymExprBuilder sym,
-                  E.MonadError String m,
-                  MonadIO m,
-                  ShowF (W4.SymExpr sym),
-                  U.HasLogCfg)
-              => ParserConfig sym
-              -> SExp
-              -> m (SymFnEnv sym)
-readSymFnEnv' cfg sexpr = do
-  symFnEnvRaw <- case sexpr of
-    S.WFSList [S.WFSAtom (AIdent "symfnenv"), S.WFSList symFnEnvRaw] -> return symFnEnvRaw
-    _ -> E.throwError "invalid top-level function environment structure"
-  readSymFns (pSymFnEnv cfg) symFnEnvRaw
-  where
-    readSymFns ::
-      SymFnEnv sym
-      -> [SExp]
-      -> m (SymFnEnv sym)
-    readSymFns env sexprs = case sexprs of
-      [] -> return env
-      (s:rest) -> do
-        (nm, symFn) <- readSomeSymFn env s
-        let env' = Map.insert nm symFn env
-        readSymFns env' rest
-      
-    readSomeSymFn ::
-      SymFnEnv sym
-      -> SExp
-      -> m (String, (SomeSome (W4.SymFn sym)))
-    readSomeSymFn env sexpr' = do
-      (name, rawSymFn) <- case sexpr' of
-        S.WFSList [(S.WFSAtom (AString name)), rawSymFn] -> return (name, rawSymFn)
-        _ -> E.throwError $ "invalid function environment structure: " ++ show sexpr'
-      ssymFn <- readSymFn' (cfg { pSymFnEnv = env }) rawSymFn
-      return (name, ssymFn)
-
-readSymFnEnv :: forall sym
-           . (W4.IsExprBuilder sym,
-              W4.IsSymExprBuilder sym,
-              ShowF (W4.SymExpr sym),
-              U.HasLogCfg)
-          => ParserConfig sym
-          -> T.Text
-          -> IO (Either String (SymFnEnv sym))
-readSymFnEnv cfg = genRead "readSymFnEnv" (readSymFnEnv' cfg)
-
-readSymFnEnvFromFile :: forall sym
-                   . (W4.IsExprBuilder sym,
-                      W4.IsSymExprBuilder sym,
-                      ShowF (W4.SymExpr sym),
-                      U.HasLogCfg)
-                  => ParserConfig sym
-                  -> FilePath
-                  -> IO (Either String (SymFnEnv sym))
-readSymFnEnvFromFile cfg fp = do
-  liftIO $ U.logIO U.Info $ "readSymFnEnvFromFile " ++ fp
-  readSymFnEnv cfg =<< T.readFile fp
+  
+readSymFn ::
+  forall sym . (W4.IsSymExprBuilder sym, ShowF (W4.SymExpr sym))
+  => SExpr
+  -> Processor sym (SomeSymFn sym)
+readSymFn (S.WFSList [ S.WFSAtom (AId "definedfn")
+                     , S.WFSAtom (AStr rawSymFnName)
+                     , rawFnType
+                     , S.WFSList argVarsRaw
+                     , bodyRaw
+                     ]) = do
+  sym <- R.reader cSym
+  symFnName <- case W4.userSymbol (T.unpack rawSymFnName) of
+                 Left _ -> E.throwError $ ("Bad symbolic function name : "
+                                           ++ (T.unpack rawSymFnName))
+                 Right solverSym -> return solverSym
+  argNames <- readFnArgs argVarsRaw
+  (argTys, _retTy) <- readFnType rawFnType
+  E.when (not (length argTys == length argNames)) $
+    E.throwError $ "Function type expected "
+    ++ (show $ length argTys)
+    ++ " args but found "
+    ++ (show $ length argNames)
+  argVars <- mapM (\(name, (Some ty)) ->
+                     case W4.userSymbol (T.unpack name) of
+                       Left _ -> E.throwError $ "Bad arg name : " ++ (T.unpack name)
+                       Right solverSym -> liftIO $ Some <$> W4.freshBoundVar sym solverSym ty)
+             $ zip argNames argTys
+  (Some body) <- let newBindings = Map.fromList
+                                   $ zip argNames
+                                   $ map (someVarExpr sym) argVars
+                 in R.local
+                    (\c -> c {cBaseEnv = Map.union (cBaseEnv c) newBindings})
+                    $ readExpr bodyRaw
+  case mkBoundVarAssignment sym argVars of
+    Some argVarAssignment -> do
+      let expand args = allFC W4.baseIsConcrete args
+      symFn <- liftIO $ W4.definedFn sym symFnName argVarAssignment body expand
+      return $ SomeSymFn symFn
+readSymFn badSExp@(S.WFSList ((S.WFSAtom (AId "definedfn")):_)) =
+  E.throwError $ ("invalid `definedfn`: " ++ (T.unpack $ printSExpr mempty badSExp))
+readSymFn (S.WFSList [ S.WFSAtom (AId "uninterpfn")
+                     , S.WFSAtom (AStr rawSymFnName)
+                     , rawFnType
+                     ]) = do
+  sym <- R.reader cSym
+  symFnName <- case W4.userSymbol (T.unpack rawSymFnName) of
+                 Left _ -> E.throwError $ ("Bad symbolic function name : "
+                                           ++ (T.unpack rawSymFnName))
+                 Right solverSym -> return solverSym
+  (argTys, (Some retTy)) <- readFnType rawFnType
+  case mkBaseTypeAssignment argTys of
+    (Some domain) -> do
+      symFn <- liftIO $ W4.freshTotalUninterpFn sym symFnName domain retTy
+      return $ SomeSymFn symFn
+readSymFn badSExp@(S.WFSList ((S.WFSAtom (AId "uninterpfn")):_)) =
+  E.throwError $ ("invalid `uninterpfn`: " ++ (T.unpack $ printSExpr mempty badSExp))
+readSymFn sexpr = E.throwError ("invalid function definition: "
+                                ++ (T.unpack $ printSExpr mempty sexpr))
