@@ -7,15 +7,34 @@ import SimpleGetOpt(usageString)
 
 import Crux.Config
 import Crux.Config.Load(commandLineOptions)
+import qualified Crux.Config.Doc.Tex as Tex
 
 configDocs :: Text -> Config opts -> Doc
 configDocs nm cfg =
+  let tdocs = Tex.configTexDocs "crux-tdl" Tex.defaultTexConfig cfg
+  in vcat [ Tex.generatedMacroStubs tdocs
+          , empty
+          , Tex.generatedDocs tdocs
+          ]
+
+  -- vcat [ heading "Command line flags:"
+  --      , nest 2 (text (usageString (commandLineOptions cfg)))
+  --      , envVarDocs cfg
+  --      , heading "Configuration file format:"
+  --      , nest 2 (generateDocs (sectionsSpec nm (cfgFile cfg)))
+  --      ]
+
+
+configDocs' :: Text -> Config opts -> Doc
+configDocs' nm cfg =
   vcat [ heading "Command line flags:"
        , nest 2 (text (usageString (commandLineOptions cfg)))
        , envVarDocs cfg
        , heading "Configuration file format:"
        , nest 2 (generateDocs (sectionsSpec nm (cfgFile cfg)))
        ]
+
+
 
 envVarDocs :: Config a -> Doc
 envVarDocs cfg
